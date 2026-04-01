@@ -9,8 +9,15 @@ device = torch.device("cpu")
 
 # Load preprocessor
 
+#def load_preprocessor():
+    #return joblib.load("models/preprocessor.joblib")
+
+import cloudpickle
+
 def load_preprocessor():
-    return joblib.load("models/preprocessor.joblib")
+    with open("models/preprocessor.pkl", "rb") as f:
+        return cloudpickle.load(f)
+
 
 
 # Load TTVAE model
