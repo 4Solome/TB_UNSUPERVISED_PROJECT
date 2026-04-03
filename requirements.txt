@@ -2,9 +2,7 @@ streamlit
 torch
 numpy
 pandas
-scikit-learn==1.6.1
-matplotlib
+scikit-learn
 seaborn
 joblib
 shap
-cloudpickle
