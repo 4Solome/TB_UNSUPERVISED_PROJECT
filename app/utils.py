@@ -5,6 +5,12 @@ import json
 from sklearn.cluster import KMeans
 from ttvae_model import TTVAE
 
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+import cloudpickle
+
 device = torch.device("cpu")
 
 # Load preprocessor
@@ -12,11 +18,39 @@ device = torch.device("cpu")
 #def load_preprocessor():
     #return joblib.load("models/preprocessor.joblib")
 
-import cloudpickle
 
-def load_preprocessor():
-    with open("models/preprocessor.pkl", "rb") as f:
-        return cloudpickle.load(f)
+
+#def load_preprocessor():
+ #   with open("models/preprocessor.pkl", "rb") as f:
+  #      return cloudpickle.load(f)
+
+
+def build_preprocessor(continuous_cols, binary_cols, categorical_cols):
+
+    cont_pipe = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", MinMaxScaler())
+    ])
+
+    bin_pipe = Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent"))
+    ])
+
+    try:
+        ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+    except TypeError:
+        ohe = OneHotEncoder(handle_unknown="ignore", sparse=False)
+
+    cat_pipe = Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("encoder", ohe)
+    ])
+
+    return ColumnTransformer([
+        ("cont", cont_pipe, continuous_cols),
+        ("bin", bin_pipe, binary_cols),
+        ("cat", cat_pipe, categorical_cols)
+    ])
 
 
 
