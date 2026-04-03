@@ -56,17 +56,48 @@ if uploaded:
     # ---------------------------------------------------------------
     # Runtime-safe preprocessing
     # ---------------------------------------------------------------
-    pre = build_preprocessor(
-        continuous_cols,
-        binary_cols,
-        categorical_cols
+    #pre = build_preprocessor(
+     #   continuous_cols,
+      #  binary_cols,
+       # categorical_cols
+    #)
+
+    #X = pre.fit_transform(df)
+
+# ---------------------------------------------------------------
+# Ensure column alignment with uploaded data
+# ---------------------------------------------------------------
+
+available_cols = set(df.columns)
+
+cont_cols = [c for c in continuous_cols if c in available_cols]
+bin_cols  = [c for c in binary_cols if c in available_cols]
+cat_cols  = [c for c in categorical_cols if c in available_cols]
+
+missing = set(continuous_cols + binary_cols + categorical_cols) - available_cols
+if len(missing) > 0:
+    st.warning(
+        f"The following expected columns are missing from uploaded file "
+        f"and will be ignored: {sorted(list(missing))}"
     )
 
-    X = pre.fit_transform(df)
+pre = build_preprocessor(
+    cont_cols,
+    bin_cols,
+    cat_cols
+)
 
+X = pre.fit_transform(df)
+
+
+    
     feature_names = load_feature_names()
     threshold = load_ood_threshold()
     kmeans = load_cluster_model()
+
+
+
+    
 
     # ---------------------------------------------------------------
     # Model inference
