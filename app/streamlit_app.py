@@ -184,36 +184,40 @@ if mode == "Single Patient":
 # ============================================================
 # MODE 2 — CSV COHORT (TRUE PSEUDOTIME)
 # ============================================================
-else:
-    st.header("Cohort Analysis (CSV Upload)")
 
-    file = st.file_uploader("Upload CSV file", type=["csv"])
+if file:
+    df = pd.read_csv(file)
 
-    if file:
-        df = pd.read_csv(file)
+    st.subheader("Uploaded CSV Preview")
+    st.dataframe(df.head())
 
-        pre = build_preprocessor(continuous_cols, binary_cols, categorical_cols)
-        dummy = {c: 0 for c in continuous_cols + binary_cols}
-        dummy.update({c: "Unknown" for c in categorical_cols})
-        pre.fit(pd.DataFrame([dummy]))
+    missing = set(continuous_cols + binary_cols + categorical_cols) - set(df.columns)
+    if missing:
+        st.error(f"Missing required columns: {missing}")
+        st.stop()
 
-        X = pre.transform(df)
-        X = pd.DataFrame(X, columns=pre.get_feature_names_out())
-        X = X.reindex(columns=feature_names, fill_value=0).values
+    pre = build_preprocessor(continuous_cols, binary_cols, categorical_cols)
 
-        latents = compute_latent(model, X)
+    dummy = {c: 0 for c in continuous_cols + binary_cols}
+    dummy.update({c: "Unknown" for c in categorical_cols})
+    pre.fit(pd.DataFrame([dummy]))
 
-        # TRUE COHORT-BASED PSEUDOTIME
-        z1 = latents[:, 0]
-        pseudotime = (z1 - z1.min()) / (z1.max() - z1.min() + 1e-10)
+    X = pre.transform(df)
+    X = pd.DataFrame(X, columns=pre.get_feature_names_out())
+    X = X.reindex(columns=feature_names, fill_value=0).values
 
-        df["pseudotime"] = pseudotime
-        df["cluster"] = assign_cluster(kmeans, latents)
+    latents = compute_latent(model, X)
 
-        st.success("Cohort analysed successfully")
-        st.dataframe(df.sort_values("pseudotime", ascending=False))
+    z1 = latents[:, 0]
+    pseudotime = (z1 - z1.min()) / (z1.max() - z1.min() + 1e-10)
+    clusters = assign_cluster(kmeans, latents)
 
-        st.caption("Pseudotime here reflects true relative progression across the cohort.")
+    df["pseudotime"] = pseudotime
+    df["phenotype"] = [cluster_info[c][0] for c in clusters]
+
+    st.subheader("Cohort Results")
+    st.dataframe(df.sort_values("pseudotime", ascending=False))
+    
 # ============================================================
 # SYNTHETIC DATA GENERATION (DECODED)
 # ============================================================
