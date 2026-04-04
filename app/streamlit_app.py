@@ -182,13 +182,13 @@ if st.button("Analyze Patient"):
     )
 
 # ============================================================
-# SYNTHETIC DATA GENERATION (OBJECTIVE 6)
+# SYNTHETIC DATA GENERATION (OBJECTIVE 6) — FIXED
 # ============================================================
 st.divider()
 st.header("Synthetic Patient Generation")
 
 st.caption(
-    "The trained generative model can sample the learned latent space to "
+    "The trained generative model samples the learned latent space to "
     "generate realistic synthetic tuberculosis patient profiles."
 )
 
@@ -199,7 +199,14 @@ if st.button("Generate Synthetic Patients"):
     model, feature_names = load_ttvae()
     device = next(model.parameters()).device
 
-    z = torch.randn(num_samples, model.latent_dim).to(device)
+    # ✅ Robust latent dimension inference
+    example_z = compute_latent(
+        model,
+        np.zeros((1, len(feature_names)))
+    )
+    latent_dim = example_z.shape[1]
+
+    z = torch.randn(num_samples, latent_dim).to(device)
 
     model.eval()
     with torch.no_grad():
