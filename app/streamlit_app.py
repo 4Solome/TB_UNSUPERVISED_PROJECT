@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import torch
 import joblib
+import os
 
 from utils import (
     load_ttvae,
@@ -21,7 +22,8 @@ st.set_page_config(page_title="TB Risk Profiling System", layout="centered")
 
 st.title("TB Risk Profiling System (TTVAE‑Based)")
 st.caption(
-    "Latent tuberculosis risk sequencing using unsupervised deep generative modeling."
+    "Latent tuberculosis risk sequencing using a Transformer-based "
+    "Tabular Variational Autoencoder (TTVAE)."
 )
 
 # ============================================================
@@ -34,7 +36,7 @@ cluster_info = {
     },
     1: {
         "name": "Active Symptomatic TB",
-        "description": "High clinical symptom burden consistent with active TB‑like disease."
+        "description": "High clinical symptom burden consistent with active TB-like disease."
     },
     2: {
         "name": "Minimal‑Information Profile",
@@ -46,12 +48,12 @@ cluster_info = {
     },
     4: {
         "name": "Laboratory‑Confirmed TB",
-        "description": "Strong bacteriological and laboratory evidence of TB."
+        "description": "Strong bacteriological and laboratory evidence of tuberculosis."
     }
 }
 
 # ============================================================
-# DATA‑DICTIONARY ENCODINGS
+# DATA DICTIONARY ENCODINGS
 # ============================================================
 EDU_MAP = {
     "None": 1,
@@ -92,7 +94,6 @@ REGIONS = ["Central", "East", "North", "West"]
 # ============================================================
 st.header("Patient Data Entry")
 
-# --- Demographics ---
 age = st.slider("Age (years)", 0, 100, 35)
 sex = st.selectbox("Sex", ["Male", "Female"])
 region = st.selectbox("Region", REGIONS)
@@ -100,7 +101,6 @@ married = st.selectbox("Marital status", list(MARITAL_MAP.keys()))
 education = st.selectbox("Education level", list(EDU_MAP.keys()))
 occupation = st.selectbox("Occupation", list(OCCUPATION_MAP.keys()))
 
-# --- Symptoms with durations ---
 st.subheader("Symptoms")
 
 cough = st.checkbox("Cough")
@@ -117,9 +117,8 @@ sputum_d = st.number_input("Duration of sputum (days)", 0, 365, 0) if sputum els
 
 night_sweats = st.checkbox("Night sweats")
 chest_pain = st.checkbox("Chest pain")
-blood_sputum = st.checkbox("Blood‑stained sputum")
+blood_sputum = st.checkbox("Blood-stained sputum")
 
-# --- Behavioral / clinical ---
 st.subheader("Behavioral & Clinical History")
 
 smoke_now = st.selectbox("Currently smoking?", ["No", "Yes"])
@@ -127,29 +126,28 @@ smoke_past = st.selectbox("Smoked in the past?", ["No", "Yes"])
 hiv = st.selectbox("HIV status", ["Negative", "Positive", "Unknown"])
 hist_rx = st.selectbox("Previously treated for TB?", ["No", "Yes"])
 
-# --- Radiology ---
-xray = st.selectbox("Chest X‑ray result", ["Normal", "Abnormal"])
+st.subheader("Radiology & Lab")
 
-# --- Laboratory ---
+xray = st.selectbox("Chest X‑ray result", ["Normal", "Abnormal"])
 smear = st.selectbox("Smear microscopy", ["Negative", "Positive"])
 culture = st.selectbox("Culture", ["Negative", "Positive"])
 genexpert = st.selectbox("GeneXpert", ["Negative", "Positive"])
 
 # ============================================================
-# ANALYZE PATIENT
+# ANALYZE
 # ============================================================
 if st.button("Analyze Patient"):
 
-    # ✅ SINGLE‑ROW INPUT WITH CORRECT SEMANTICS
+    # -------------------------------
+    # Build input row
+    # -------------------------------
     input_df = pd.DataFrame([{
-        # Continuous
         "age_census": age,
         "cough_d": cough_d,
         "fever_d": fever_d,
         "wloss_d": wloss_d,
         "sputum_d": sputum_d,
 
-        # Binary
         "sex_census": 1 if sex == "Male" else 2,
         "cough": int(cough),
         "fever": int(fever),
@@ -167,36 +165,47 @@ if st.button("Analyze Patient"):
         "culture": 1 if culture == "Positive" else 0,
         "bact": 1 if genexpert == "Positive" else 0,
 
-        # Categorical
         "region": region,
         "married": MARITAL_MAP[married],
         "edu": EDU_MAP[education],
         "occupation": OCCUPATION_MAP[occupation]
     }])
 
-    # ========================================================
-    # ✅ LOAD TRAINED COMPONENTS
-    # ========================================================
+    # -------------------------------
+    # Load models
+    # -------------------------------
     model, feature_names = load_ttvae()
     kmeans = load_cluster_model()
     ood_threshold = load_ood_threshold()
 
-    # ✅ CRITICAL FIX: LOAD THE TRAINED PREPROCESSOR
+    # -------------------------------
+    # Load preprocessor SAFELY
+    # -------------------------------
+    if not os.path.exists("preprocessor.pkl"):
+        st.error(
+            "❌ The trained preprocessor file (`preprocessor.pkl`) was not found.\n\n"
+            "Please ensure it is saved during training and placed in the app directory."
+        )
+        st.stop()
+
     preprocessor = joblib.load("preprocessor.pkl")
 
     X = preprocessor.transform(input_df)
     X = pd.DataFrame(X, columns=preprocessor.get_feature_names_out())
     X = X.reindex(columns=feature_names, fill_value=0).values
 
+    # -------------------------------
+    # Inference
+    # -------------------------------
     latent = compute_latent(model, X)
     pseudotime = float(compute_pseudotime(latent)[0])
     cluster = int(assign_cluster(kmeans, latent)[0])
     ood, recon_error = check_ood(model, X, ood_threshold)
     recon_error = float(np.squeeze(recon_error))
 
-    # ========================================================
-    # RESULTS
-    # ========================================================
+    # -------------------------------
+    # Results
+    # -------------------------------
     st.header("Results")
 
     st.metric("TB Risk Score (Pseudotime)", f"{pseudotime:.2f}")
@@ -212,13 +221,7 @@ if st.button("Analyze Patient"):
 
     st.subheader("Latent Phenotype")
     st.write(f"**{cluster_info[cluster]['name']}**")
-    st.caption(cluster_info[cluster]["description"])
-
-    st.subheader("Reliability Assessment")
-    st.warning(
-        "⚠️ Input lies outside training distribution."
-        if ood else "✅ Input lies within training distribution."
-    )
+    st.caption(cluster_info[cluster]['description'])
 
     st.subheader("Model Confidence")
     st.write(f"Reconstruction Error: `{recon_error:.4f}`")
