@@ -12,10 +12,9 @@ from ttvae_model import TTVAE
 
 device = torch.device("cpu")
 
-
-# -------------------------------------------------------------------
-# Runtime-safe preprocessing (NO pickling, NO version mismatch)
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Build preprocessing (no pickling, runtime safe)
+# ---------------------------------------------------------------------
 
 def build_preprocessor(continuous_cols, binary_cols, categorical_cols):
 
@@ -45,25 +44,27 @@ def build_preprocessor(continuous_cols, binary_cols, categorical_cols):
     ])
 
 
-# -------------------------------------------------------------------
-# Load trained TTVAE model
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Load trained TTVAE using training feature space
+# ---------------------------------------------------------------------
 
-def load_ttvae(input_dim):
-    model = TTVAE(input_dim=input_dim).to(device)
+def load_ttvae():
+    with open("models/feature_names.json", "r") as f:
+        feature_names = json.load(f)
+
+    D_in = len(feature_names)
+
+    model = TTVAE(D_in=D_in).to(device)
     state = torch.load("models/ttvae_best.pth", map_location=device)
     model.load_state_dict(state)
     model.eval()
-    return model
+
+    return model, feature_names
 
 
-# -------------------------------------------------------------------
-# Metadata & auxiliary models
-# -------------------------------------------------------------------
-
-def load_feature_names():
-    with open("models/feature_names.json", "r") as f:
-        return json.load(f)
+# ---------------------------------------------------------------------
+# Auxiliary artifacts
+# ---------------------------------------------------------------------
 
 def load_ood_threshold():
     with open("models/ood_threshold.json", "r") as f:
@@ -73,9 +74,9 @@ def load_cluster_model():
     return joblib.load("models/kmeans_model.joblib")
 
 
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------
 # Inference utilities
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------
 
 def compute_latent(model, X):
     X_t = torch.tensor(X, dtype=torch.float32).to(device)
