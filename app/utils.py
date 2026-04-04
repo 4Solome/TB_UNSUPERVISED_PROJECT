@@ -13,9 +13,17 @@ from ttvae_model import TTVAE
 device = torch.device("cpu")
 
 # ---------------------------------------------------------------------
+# Load pseudotime reference bounds (computed ONCE from training latents)
+# ---------------------------------------------------------------------
+with open("models/pseudotime_bounds.json", "r") as f:
+    _pt_bounds = json.load(f)
+
+_Z1_MIN = _pt_bounds["z1_min"]
+_Z1_MAX = _pt_bounds["z1_max"]
+
+# ---------------------------------------------------------------------
 # Build preprocessing (no pickling, runtime safe)
 # ---------------------------------------------------------------------
-
 def build_preprocessor(continuous_cols, binary_cols, categorical_cols):
 
     cont_pipe = Pipeline([
@@ -43,11 +51,9 @@ def build_preprocessor(continuous_cols, binary_cols, categorical_cols):
         ("cat", cat_pipe, categorical_cols)
     ])
 
-
 # ---------------------------------------------------------------------
 # Load trained TTVAE using training feature space
 # ---------------------------------------------------------------------
-
 def load_ttvae():
     with open("models/feature_names.json", "r") as f:
         feature_names = json.load(f)
@@ -61,11 +67,9 @@ def load_ttvae():
 
     return model, feature_names
 
-
 # ---------------------------------------------------------------------
 # Auxiliary artifacts
 # ---------------------------------------------------------------------
-
 def load_ood_threshold():
     with open("models/ood_threshold.json", "r") as f:
         return json.load(f)["ood_threshold"]
@@ -73,11 +77,9 @@ def load_ood_threshold():
 def load_cluster_model():
     return joblib.load("models/kmeans_model.joblib")
 
-
 # ---------------------------------------------------------------------
 # Inference utilities
 # ---------------------------------------------------------------------
-
 def compute_latent(model, X):
     X_t = torch.tensor(X, dtype=torch.float32).to(device)
     with torch.no_grad():
@@ -85,8 +87,12 @@ def compute_latent(model, X):
     return mu.cpu().numpy()
 
 def compute_pseudotime(latents):
+    """
+    Compute pseudotime relative to the training population.
+    Works for single-patient and multi-patient inference.
+    """
     z1 = latents[:, 0]
-    return (z1 - z1.min()) / (z1.max() - z1.min() + 1e-10)
+    return (z1 - _Z1_MIN) / (_Z1_MAX - _Z1_MIN + 1e-10)
 
 def check_ood(model, X, threshold):
     X_t = torch.tensor(X, dtype=torch.float32).to(device)
