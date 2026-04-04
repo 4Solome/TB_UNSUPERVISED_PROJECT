@@ -184,39 +184,76 @@ if mode == "Single Patient":
 # ============================================================
 # MODE 2 — CSV COHORT (TRUE PSEUDOTIME)
 # ============================================================
+else:
+    st.header("Cohort Analysis (CSV Upload)")
 
-if file:
-    df = pd.read_csv(file)
+    # ✅ DEFINE file FIRST (this was missing)
+    uploaded_file = st.file_uploader(
+        "Upload CSV file for cohort analysis",
+        type=["csv"]
+    )
 
-    st.subheader("Uploaded CSV Preview")
-    st.dataframe(df.head())
+    if uploaded_file is None:
+        st.info("Please upload a CSV file to run cohort-based pseudotime analysis.")
+    else:
+        df = pd.read_csv(uploaded_file)
 
-    missing = set(continuous_cols + binary_cols + categorical_cols) - set(df.columns)
-    if missing:
-        st.error(f"Missing required columns: {missing}")
-        st.stop()
+        st.subheader("Uploaded CSV Preview")
+        st.dataframe(df.head())
 
-    pre = build_preprocessor(continuous_cols, binary_cols, categorical_cols)
+        # ✅ Check required columns
+        required_cols = continuous_cols + binary_cols + categorical_cols
+        missing = set(required_cols) - set(df.columns)
 
-    dummy = {c: 0 for c in continuous_cols + binary_cols}
-    dummy.update({c: "Unknown" for c in categorical_cols})
-    pre.fit(pd.DataFrame([dummy]))
+        if missing:
+            st.error(f"Missing required columns in CSV: {sorted(missing)}")
+            st.stop()
 
-    X = pre.transform(df)
-    X = pd.DataFrame(X, columns=pre.get_feature_names_out())
-    X = X.reindex(columns=feature_names, fill_value=0).values
+        # Build preprocessor
+        pre = build_preprocessor(
+            continuous_cols,
+            binary_cols,
+            categorical_cols
+        )
 
-    latents = compute_latent(model, X)
+        # Dummy fit (same as single-patient mode)
+        dummy = {}
+        for c in continuous_cols:
+            dummy[c] = 0.0
+        for c in binary_cols:
+            dummy[c] = 0
+        for c in categorical_cols:
+            dummy[c] = "Unknown"
 
-    z1 = latents[:, 0]
-    pseudotime = (z1 - z1.min()) / (z1.max() - z1.min() + 1e-10)
-    clusters = assign_cluster(kmeans, latents)
+        pre.fit(pd.DataFrame([dummy]))
 
-    df["pseudotime"] = pseudotime
-    df["phenotype"] = [cluster_info[c][0] for c in clusters]
+        # Transform cohort
+        X = pre.transform(df)
+        X = pd.DataFrame(X, columns=pre.get_feature_names_out())
 
-    st.subheader("Cohort Results")
-    st.dataframe(df.sort_values("pseudotime", ascending=False))
+        with open("models/feature_names.json") as f:
+            feature_names = json.load(f)
+
+        X = X.reindex(columns=feature_names, fill_value=0).values
+
+        # Latent inference
+        latents = compute_latent(model, X)
+
+        # ✅ TRUE cohort-based pseudotime
+        z1 = latents[:, 0]
+        pseudotime = (z1 - z1.min()) / (z1.max() - z1.min() + 1e-10)
+
+        clusters = assign_cluster(kmeans, latents)
+
+        df["pseudotime"] = pseudotime
+        df["phenotype"] = [cluster_info[c][0] for c in clusters]
+
+        st.subheader("Cohort Results")
+        st.dataframe(df.sort_values("pseudotime", ascending=False))
+
+        st.caption(
+            "Pseudotime here reflects true relative progression across the uploaded cohort."
+        )
     
 # ============================================================
 # SYNTHETIC DATA GENERATION (DECODED)
