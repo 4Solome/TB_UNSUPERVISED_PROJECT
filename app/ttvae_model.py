@@ -2,8 +2,16 @@ import torch
 import torch.nn as nn
 
 class TTVAE(nn.Module):
-    def __init__(self, D_in, latent_dim=32, d_model=64,
-                 n_heads=4, n_layers=2, ff_dim=128, dropout=0.05):
+    def __init__(
+        self,
+        D_in,
+        latent_dim=32,
+        d_model=64,
+        n_heads=4,
+        n_layers=2,
+        ff_dim=128,
+        dropout=0.05
+    ):
         super().__init__()
 
         self.feature_weight = nn.Parameter(torch.randn(D_in, d_model) * 0.02)
@@ -34,7 +42,11 @@ class TTVAE(nn.Module):
         )
 
     def embed(self, x):
-        t = x.unsqueeze(-1) * self.feature_weight.unsqueeze(0) + self.feature_bias.unsqueeze(0)
+        t = (
+            x.unsqueeze(-1)
+            * self.feature_weight.unsqueeze(0)
+            + self.feature_bias.unsqueeze(0)
+        )
         return t + self.pos
 
     def encode(self, x):
@@ -52,4 +64,5 @@ class TTVAE(nn.Module):
     def forward(self, x):
         mu, logv = self.encode(x)
         z = self.reparam(mu, logv)
-        return self.decode(z), mu, logv
+        rec = self.decode(z)
+        return rec, mu, logv
