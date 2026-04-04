@@ -15,7 +15,7 @@ from utils import (
 )
 
 # ============================================================
-# PAGE SETUP
+# PAGE CONFIGURATION
 # ============================================================
 st.set_page_config(
     page_title="TB Risk Profiling System",
@@ -25,12 +25,12 @@ st.set_page_config(
 st.title("TB Risk Profiling System (TTVAE‑Based)")
 st.caption(
     "An interactive prototype for latent tuberculosis risk sequencing, "
-    "phenotype identification, and uncertainty‑aware inference using "
-    "Transformer‑based unsupervised representation learning."
+    "phenotype identification, uncertainty detection, and synthetic patient generation "
+    "using Transformer‑based unsupervised representation learning."
 )
 
 # ============================================================
-# LATENT PHENOTYPE DEFINITIONS
+# LATENT PHENOTYPE DEFINITIONS (FINAL)
 # ============================================================
 cluster_info = {
     0: {
@@ -47,7 +47,7 @@ cluster_info = {
     },
     3: {
         "name": "Transitional TB Risk",
-        "description": "Intermediate phenotype bridging lower-risk and laboratory-confirmed profiles."
+        "description": "Intermediate phenotype between lower-risk and laboratory-confirmed profiles."
     },
     4: {
         "name": "Laboratory-Confirmed TB",
@@ -56,7 +56,7 @@ cluster_info = {
 }
 
 # ============================================================
-# INPUT SECTION
+# INPUT PANEL
 # ============================================================
 st.header("Patient Data Entry")
 
@@ -89,7 +89,9 @@ culture = st.selectbox("Culture", ["Not done", "Negative", "Positive"])
 # ============================================================
 if st.button("Analyze Patient"):
 
-    # -------- Build input ----------
+    # -------------------------------
+    # Build input dataframe (1 row)
+    # -------------------------------
     input_df = pd.DataFrame([{
         "age_census": age,
         "sex_census": 1 if sex == "Male" else 2,
@@ -108,12 +110,16 @@ if st.button("Analyze Patient"):
         "bact": 1 if genexpert == "Positive" else 0
     }])
 
-    # -------- Load models ----------
+    # -------------------------------
+    # Load trained components
+    # -------------------------------
     model, feature_names = load_ttvae()
     kmeans = load_cluster_model()
     ood_threshold = load_ood_threshold()
 
-    # -------- Preprocessing ----------
+    # -------------------------------
+    # Preprocessing
+    # -------------------------------
     pre = build_preprocessor(
         continuous_cols=["age_census"],
         binary_cols=[c for c in input_df.columns if c != "age_census"],
@@ -124,11 +130,17 @@ if st.button("Analyze Patient"):
     X = pd.DataFrame(X, columns=pre.get_feature_names_out())
     X = X.reindex(columns=feature_names, fill_value=0).values
 
-    # -------- Inference ----------
+    # -------------------------------
+    # Inference
+    # -------------------------------
     latent = compute_latent(model, X)
-    pseudotime = float(compute_pseudotime(latent)[0])   # ✅ CAST FIX
+
+    pseudotime = float(compute_pseudotime(latent)[0])
     cluster = int(assign_cluster(kmeans, latent)[0])
     ood_flag, recon_error = check_ood(model, X, ood_threshold)
+
+    # ✅ CRITICAL FIX
+    recon_error = float(np.squeeze(recon_error))
 
     # ========================================================
     # RESULTS PANEL
@@ -147,38 +159,37 @@ if st.button("Analyze Patient"):
     st.progress(pseudotime)
     st.caption(
         "Continuous latent risk position approximating tuberculosis progression "
-        "from cross‑sectional observations."
+        "derived from cross‑sectional observations."
     )
 
-    phenotype = cluster_info[cluster]["name"]
-    description = cluster_info[cluster]["description"]
-
     st.subheader("Latent Phenotype")
-    st.write(f"**{phenotype}**")
-    st.caption(description)
+    st.write(f"**{cluster_info[cluster]['name']}**")
+    st.caption(cluster_info[cluster]['description'])
 
     st.subheader("Reliability Assessment")
     if ood_flag:
         st.warning(
-            "⚠️ This patient lies outside the model’s training distribution. "
+            "⚠️ This patient profile lies outside the model’s training distribution. "
             "Interpretation may be unreliable."
         )
     else:
-        st.success("✅ Patient lies within known training distribution.")
+        st.success("✅ This patient profile lies within known training patterns.")
 
     st.subheader("Model Confidence")
     st.write(f"Reconstruction Error: `{recon_error:.4f}`")
-    st.caption("Higher values indicate more unusual or less well‑represented profiles.")
+    st.caption(
+        "Lower error indicates better representation within the learned latent space."
+    )
 
 # ============================================================
-# ✅ SYNTHETIC DATA GENERATION (OBJECTIVE 6)
+# SYNTHETIC DATA GENERATION (OBJECTIVE 6)
 # ============================================================
 st.divider()
 st.header("Synthetic Patient Generation")
 
 st.caption(
-    "The trained generative model can sample the latent space to produce "
-    "realistic synthetic tuberculosis patient profiles."
+    "The trained generative model can sample the learned latent space to "
+    "generate realistic synthetic tuberculosis patient profiles."
 )
 
 num_samples = st.slider("Number of synthetic patients", 10, 100, 50)
