@@ -1,12 +1,9 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
-import seaborn as sns
 import matplotlib.pyplot as plt
 
 from utils import (
     build_preprocessor,
-    load_feature_names,
     load_ttvae,
     load_ood_threshold,
     load_cluster_model,
@@ -26,9 +23,9 @@ st.markdown(
 
 uploaded = st.file_uploader("Upload CSV", type=["csv"])
 
-# -------------------------------------------------------------------
-# Feature groups (must match training)
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Feature groups (must match training definitions)
+# ---------------------------------------------------------------------
 
 continuous_cols = [
     "age_census", "cough_d", "fever_d", "wloss_d",
@@ -44,13 +41,13 @@ binary_cols = [
 
 categorical_cols = [
     "region", "married", "edu", "occupation",
-    "xrayres", "central_cxr_res", "zn",
-    "genexpert", "final_result"
+    "xrayres", "central_cxr_res",
+    "zn", "genexpert", "final_result"
 ]
 
-# -------------------------------------------------------------------
-# Main application logic
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# App logic
+# ---------------------------------------------------------------------
 
 if uploaded:
 
@@ -58,43 +55,41 @@ if uploaded:
     st.write("Uploaded Data Preview:", df.head())
 
     # ---------------------------------------------------------------
-    # Ensure column alignment with uploaded data
+    # Align schema with available columns
     # ---------------------------------------------------------------
     available_cols = set(df.columns)
 
-    cont_cols = [c for c in continuous_cols if c in available_cols]
-    bin_cols  = [c for c in binary_cols if c in available_cols]
-    cat_cols  = [c for c in categorical_cols if c in available_cols]
+    cont = [c for c in continuous_cols if c in available_cols]
+    bin_ = [c for c in binary_cols if c in available_cols]
+    cat  = [c for c in categorical_cols if c in available_cols]
 
     missing = set(continuous_cols + binary_cols + categorical_cols) - available_cols
-    if len(missing) > 0:
+    if missing:
         st.warning(
-            "The following expected columns are missing and were ignored: "
+            "The following expected columns were missing and ignored:\n"
             + ", ".join(sorted(missing))
         )
 
     # ---------------------------------------------------------------
-    # Runtime-safe preprocessing (no pickle)
+    # Preprocessing
     # ---------------------------------------------------------------
-    pre = build_preprocessor(
-        cont_cols,
-        bin_cols,
-        cat_cols
-    )
-
+    pre = build_preprocessor(cont, bin_, cat)
     X = pre.fit_transform(df)
 
     # ---------------------------------------------------------------
-    # Load artifacts
+    # Load model + ensure fixed training input space
     # ---------------------------------------------------------------
-    feature_names = load_feature_names()
-    threshold = load_ood_threshold()
-    kmeans = load_cluster_model()
+    model, feature_names = load_ttvae()
+
+    X_df = pd.DataFrame(X, columns=pre.get_feature_names_out())
+    X_df = X_df.reindex(columns=feature_names, fill_value=0)
+    X = X_df.values
 
     # ---------------------------------------------------------------
-    # Model inference
+    # Inference
     # ---------------------------------------------------------------
-    model = load_ttvae(input_dim=X.shape[1])
+    threshold = load_ood_threshold()
+    kmeans = load_cluster_model()
 
     latents = compute_latent(model, X)
     pseudotime = compute_pseudotime(latents)
@@ -102,7 +97,7 @@ if uploaded:
     ood_flags, errors = check_ood(model, X, threshold)
 
     # ---------------------------------------------------------------
-    # Tabular outputs
+    # Outputs
     # ---------------------------------------------------------------
     st.subheader("Patient-Level Results")
 
@@ -122,7 +117,7 @@ if uploaded:
     )
 
     # ---------------------------------------------------------------
-    # Visual outputs (deployment-safe)
+    # Visualization
     # ---------------------------------------------------------------
     st.subheader("Latent Space & Pseudotime")
 
