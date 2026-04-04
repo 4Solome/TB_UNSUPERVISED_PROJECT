@@ -27,7 +27,7 @@ st.markdown(
 uploaded = st.file_uploader("Upload CSV", type=["csv"])
 
 # -------------------------------------------------------------------
-# IMPORTANT: feature groups must MATCH training
+# Feature groups (must match training)
 # -------------------------------------------------------------------
 
 continuous_cols = [
@@ -48,56 +48,48 @@ categorical_cols = [
     "genexpert", "final_result"
 ]
 
+# -------------------------------------------------------------------
+# Main application logic
+# -------------------------------------------------------------------
+
 if uploaded:
 
     df = pd.read_csv(uploaded)
     st.write("Uploaded Data Preview:", df.head())
 
     # ---------------------------------------------------------------
-    # Runtime-safe preprocessing
+    # Ensure column alignment with uploaded data
     # ---------------------------------------------------------------
-    #pre = build_preprocessor(
-     #   continuous_cols,
-      #  binary_cols,
-       # categorical_cols
-    #)
+    available_cols = set(df.columns)
 
-    #X = pre.fit_transform(df)
+    cont_cols = [c for c in continuous_cols if c in available_cols]
+    bin_cols  = [c for c in binary_cols if c in available_cols]
+    cat_cols  = [c for c in categorical_cols if c in available_cols]
 
-# ---------------------------------------------------------------
-# Ensure column alignment with uploaded data
-# ---------------------------------------------------------------
+    missing = set(continuous_cols + binary_cols + categorical_cols) - available_cols
+    if len(missing) > 0:
+        st.warning(
+            "The following expected columns are missing and were ignored: "
+            + ", ".join(sorted(missing))
+        )
 
-available_cols = set(df.columns)
-
-cont_cols = [c for c in continuous_cols if c in available_cols]
-bin_cols  = [c for c in binary_cols if c in available_cols]
-cat_cols  = [c for c in categorical_cols if c in available_cols]
-
-missing = set(continuous_cols + binary_cols + categorical_cols) - available_cols
-if len(missing) > 0:
-    st.warning(
-        f"The following expected columns are missing from uploaded file "
-        f"and will be ignored: {sorted(list(missing))}"
+    # ---------------------------------------------------------------
+    # Runtime-safe preprocessing (no pickle)
+    # ---------------------------------------------------------------
+    pre = build_preprocessor(
+        cont_cols,
+        bin_cols,
+        cat_cols
     )
 
-pre = build_preprocessor(
-    cont_cols,
-    bin_cols,
-    cat_cols
-)
+    X = pre.fit_transform(df)
 
-X = pre.fit_transform(df)
-
-
-    
+    # ---------------------------------------------------------------
+    # Load artifacts
+    # ---------------------------------------------------------------
     feature_names = load_feature_names()
     threshold = load_ood_threshold()
     kmeans = load_cluster_model()
-
-
-
-    
 
     # ---------------------------------------------------------------
     # Model inference
@@ -122,6 +114,7 @@ X = pre.fit_transform(df)
     })
 
     st.dataframe(results)
+
     st.download_button(
         "Download Results CSV",
         results.to_csv(index=False),
