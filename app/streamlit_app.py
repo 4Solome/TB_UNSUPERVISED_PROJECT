@@ -1,41 +1,133 @@
-import json
+import streamlit as st
+import pandas as pd
+import numpy as np
+import torch
 import joblib
+import json
 import os
 
-# --------------------------------------------------------
-# LOAD TRAINED ARTIFACTS (ONCE)
-# --------------------------------------------------------
-@st.cache_resource
-def load_artifacts():
-    preprocessor = joblib.load("preprocessor.joblib")
-    kmeans = joblib.load("kmeans_model.joblib")
+from utils import (
+    load_ttvae,
+    compute_latent,
+    compute_pseudotime,
+    check_ood,
+    assign_cluster
+)
 
-    with open("feature_names.json", "r") as f:
-        feature_names = json.load(f)
+# ============================================================
+# PAGE CONFIG
+# ============================================================
+st.set_page_config(page_title="TB Risk Profiling System", layout="centered")
 
-    with open("ood_threshold.json", "r") as f:
-        ood_threshold = json.load(f)["threshold"]
+st.title("TB Risk Profiling System (TTVAE‑Based)")
+st.caption(
+    "Latent tuberculosis risk sequencing using a Transformer‑based "
+    "Tabular Variational Autoencoder."
+)
 
-    model = load_ttvae()[0]
+# ============================================================
+# CLUSTER LABELS
+# ============================================================
+cluster_info = {
+    0: {
+        "name": "Low‑Symptom TB Risk",
+        "description": "Low symptom burden but still within the learned TB‑risk latent space."
+    },
+    1: {
+        "name": "Active Symptomatic TB",
+        "description": "High clinical symptom burden consistent with active TB‑like disease."
+    },
+    2: {
+        "name": "Minimal‑Information Profile",
+        "description": "Sparse diagnostic information with weak feature activation."
+    },
+    3: {
+        "name": "Transitional TB Risk",
+        "description": "Mixed clinical and laboratory signals."
+    },
+    4: {
+        "name": "Laboratory‑Confirmed TB",
+        "description": "Strong bacteriological and laboratory evidence of tuberculosis."
+    }
+}
 
-    return preprocessor, kmeans, feature_names, ood_threshold, model
+# ============================================================
+# INPUT PANEL
+# ============================================================
+st.header("Patient Data Entry")
 
+age = st.slider("Age (years)", 0, 100, 35)
+sex = st.selectbox("Sex", ["Male", "Female"])
+region = st.selectbox("Region", ["Central", "East", "North", "West"])
 
-# --------------------------------------------------------
-# ANALYZE PATIENT
-# --------------------------------------------------------
+married = st.selectbox(
+    "Marital status",
+    ["Single", "Married", "Separated", "Divorced", "Widowed", "Don't know", "Unknown"]
+)
+
+education = st.selectbox(
+    "Education level",
+    ["None", "Primary", "Senior 1–4", "Senior 5–6", "Tertiary", "Don't know", "Unknown"]
+)
+
+occupation = st.selectbox(
+    "Occupation",
+    ["Business", "Civil servant", "Healthcare worker", "Student",
+     "Unemployed", "Farmer", "House wife/husband", "Skilled labor", "Other"]
+)
+
+# ---------------- Symptoms ----------------
+st.subheader("Symptoms")
+
+cough = st.checkbox("Cough")
+cough_d = st.number_input("Duration of cough (days)", 0, 365, 0) if cough else 0
+
+fever = st.checkbox("Fever")
+fever_d = st.number_input("Duration of fever (days)", 0, 365, 0) if fever else 0
+
+weight_loss = st.checkbox("Weight loss")
+wloss_d = st.number_input("Duration of weight loss (days)", 0, 2000, 0) if weight_loss else 0
+
+sputum = st.checkbox("Sputum production")
+sputum_d = st.number_input("Duration of sputum (days)", 0, 365, 0) if sputum else 0
+
+night_sweats = st.checkbox("Night sweats")
+chest_pain = st.checkbox("Chest pain")
+blood_sputum = st.checkbox("Blood‑stained sputum")
+
+# ---------------- Clinical / Behaviour ----------------
+st.subheader("Behavioural & Clinical History")
+
+smoke_now = st.selectbox("Currently smoking?", ["No", "Yes"])
+smoke_past = st.selectbox("Smoked in the past?", ["No", "Yes"])
+hiv = st.selectbox("HIV status", ["Negative", "Positive", "Unknown"])
+hist_rx = st.selectbox("Previously treated for TB?", ["No", "Yes"])
+
+# ---------------- Radiology & Lab ----------------
+st.subheader("Radiology & Laboratory")
+
+xray = st.selectbox("Chest X‑ray", ["Normal", "Abnormal"])
+smear = st.selectbox("Smear microscopy", ["Negative", "Positive"])
+culture = st.selectbox("Culture", ["Negative", "Positive"])
+genexpert = st.selectbox("GeneXpert", ["Negative", "Positive"])
+
+# ============================================================
+# ANALYZE
+# ============================================================
 if st.button("Analyze Patient"):
 
-    preprocessor, kmeans, feature_names, ood_threshold, model = load_artifacts()
-
-    # ---- build input_df exactly as before ----
+    # --------------------------------------------------------
+    # Build input EXACTLY as training saw it
+    # --------------------------------------------------------
     input_df = pd.DataFrame([{
+        # Continuous
         "age_census": age,
         "cough_d": cough_d,
         "fever_d": fever_d,
         "wloss_d": wloss_d,
         "sputum_d": sputum_d,
 
+        # Binary
         "sex_census": 1 if sex == "Male" else 2,
         "cough": int(cough),
         "fever": int(fever),
@@ -54,32 +146,50 @@ if st.button("Analyze Patient"):
         "cult_pos": 1 if culture == "Positive" else 0,
         "bact": 1 if genexpert == "Positive" else 0,
 
+        # ✅ CATEGORICALS AS STRINGS (CRITICAL FIX)
         "region": region,
-        "married": MARITAL_MAP[married],
-        "edu": EDU_MAP[education],
-        "occupation": OCCUPATION_MAP[occupation]
+        "married": married,
+        "edu": education,
+        "occupation": occupation
     }])
 
-    # ----------------------------------------------------
-    # ✅ CORRECT PREPROCESSING (NO FITTING)
-    # ----------------------------------------------------
+    # --------------------------------------------------------
+    # Load trained artifacts
+    # --------------------------------------------------------
+    if not os.path.exists("models/preprocessor.pkl"):
+        st.error("preprocessor.pkl not found in models/")
+        st.stop()
+
+    preprocessor = joblib.load("models/preprocessor.pkl")
+
+    with open("models/feature_names.json", "r") as f:
+        feature_names = json.load(f)
+
+    model, _ = load_ttvae()
+    kmeans = joblib.load("models/kmeans_model.joblib")
+
+    with open("models/ood_threshold.json", "r") as f:
+        ood_threshold = json.load(f)["ood_threshold"]
+
+    # --------------------------------------------------------
+    # ✅ CORRECT TRANSFORM (NO FITTING)
+    # --------------------------------------------------------
     X = preprocessor.transform(input_df)
     X = pd.DataFrame(X, columns=preprocessor.get_feature_names_out())
     X = X.reindex(columns=feature_names, fill_value=0).values
 
-    # ----------------------------------------------------
-    # MODEL INFERENCE
-    # ----------------------------------------------------
-    latent = compute_latent(model, X)
-    pseudotime = float(compute_pseudotime(latent)[0])
-    cluster = int(assign_cluster(kmeans, latent)[0])
+    # --------------------------------------------------------
+    # Inference
+    # --------------------------------------------------------
+    latents = compute_latent(model, X)
+    pseudotime = float(compute_pseudotime(latents)[0])
+    cluster = int(assign_cluster(kmeans, latents)[0])
     ood, recon_error = check_ood(model, X, ood_threshold)
-
     recon_error = float(np.squeeze(recon_error))
 
-    # ----------------------------------------------------
-    # RESULTS
-    # ----------------------------------------------------
+    # --------------------------------------------------------
+    # Results
+    # --------------------------------------------------------
     st.header("Results")
 
     st.metric("TB Risk Score (Pseudotime)", f"{pseudotime:.2f}")
