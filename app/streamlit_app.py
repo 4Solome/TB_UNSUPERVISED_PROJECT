@@ -2,9 +2,9 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import torch
+import joblib
 
 from utils import (
-    build_preprocessor,
     load_ttvae,
     load_cluster_model,
     load_ood_threshold,
@@ -15,20 +15,44 @@ from utils import (
 )
 
 # ============================================================
-# PAGE CONFIGURATION
+# PAGE CONFIG
 # ============================================================
 st.set_page_config(page_title="TB Risk Profiling System", layout="centered")
 
 st.title("TB Risk Profiling System (TTVAE‑Based)")
 st.caption(
-    "Latent tuberculosis risk sequencing and phenotype identification using "
-    "Transformer‑based unsupervised representation learning."
+    "Latent tuberculosis risk sequencing using unsupervised deep generative modeling."
 )
 
 # ============================================================
-# CATEGORY CODE MAPPINGS (FROM DATA DICTIONARY)
+# CLUSTER LABELS
 # ============================================================
+cluster_info = {
+    0: {
+        "name": "Low‑Symptom TB Risk",
+        "description": "Low symptom burden but still within the learned TB‑risk space."
+    },
+    1: {
+        "name": "Active Symptomatic TB",
+        "description": "High clinical symptom burden consistent with active TB‑like disease."
+    },
+    2: {
+        "name": "Minimal‑Information Profile",
+        "description": "Sparse diagnostic information with weak overall feature activation."
+    },
+    3: {
+        "name": "Transitional TB Risk",
+        "description": "Mixed signals between lower‑risk and laboratory‑confirmed profiles."
+    },
+    4: {
+        "name": "Laboratory‑Confirmed TB",
+        "description": "Strong bacteriological and laboratory evidence of TB."
+    }
+}
 
+# ============================================================
+# DATA‑DICTIONARY ENCODINGS
+# ============================================================
 EDU_MAP = {
     "None": 1,
     "Primary": 2,
@@ -61,22 +85,22 @@ OCCUPATION_MAP = {
     "Other": 9
 }
 
-REGION_MAP = ["Central", "East", "North", "West"]
+REGIONS = ["Central", "East", "North", "West"]
 
 # ============================================================
 # INPUT PANEL
 # ============================================================
 st.header("Patient Data Entry")
 
-# ---------------- Demographics ----------------
+# --- Demographics ---
 age = st.slider("Age (years)", 0, 100, 35)
 sex = st.selectbox("Sex", ["Male", "Female"])
-region = st.selectbox("Region", REGION_MAP)
+region = st.selectbox("Region", REGIONS)
 married = st.selectbox("Marital status", list(MARITAL_MAP.keys()))
 education = st.selectbox("Education level", list(EDU_MAP.keys()))
 occupation = st.selectbox("Occupation", list(OCCUPATION_MAP.keys()))
 
-# ---------------- Symptoms ----------------
+# --- Symptoms with durations ---
 st.subheader("Symptoms")
 
 cough = st.checkbox("Cough")
@@ -95,31 +119,28 @@ night_sweats = st.checkbox("Night sweats")
 chest_pain = st.checkbox("Chest pain")
 blood_sputum = st.checkbox("Blood‑stained sputum")
 
-# ---------------- Behavioral / Clinical ----------------
-st.subheader("Behavioral / Clinical History")
+# --- Behavioral / clinical ---
+st.subheader("Behavioral & Clinical History")
 
 smoke_now = st.selectbox("Currently smoking?", ["No", "Yes"])
 smoke_past = st.selectbox("Smoked in the past?", ["No", "Yes"])
 hiv = st.selectbox("HIV status", ["Negative", "Positive", "Unknown"])
 hist_rx = st.selectbox("Previously treated for TB?", ["No", "Yes"])
 
-# ---------------- Radiology ----------------
-st.subheader("Radiology")
+# --- Radiology ---
+xray = st.selectbox("Chest X‑ray result", ["Normal", "Abnormal"])
 
-xray_normal = st.selectbox("Chest X‑ray", ["Normal", "Abnormal"])
-
-# ---------------- Laboratory ----------------
-st.subheader("Laboratory")
-
-smear_pos = st.selectbox("Smear microscopy", ["Negative", "Positive"])
-culture = st.selectbox("Culture result", ["Negative", "Positive"])
-bact = st.selectbox("GeneXpert", ["Negative", "Positive"])
+# --- Laboratory ---
+smear = st.selectbox("Smear microscopy", ["Negative", "Positive"])
+culture = st.selectbox("Culture", ["Negative", "Positive"])
+genexpert = st.selectbox("GeneXpert", ["Negative", "Positive"])
 
 # ============================================================
 # ANALYZE PATIENT
 # ============================================================
 if st.button("Analyze Patient"):
 
+    # ✅ SINGLE‑ROW INPUT WITH CORRECT SEMANTICS
     input_df = pd.DataFrame([{
         # Continuous
         "age_census": age,
@@ -141,10 +162,10 @@ if st.button("Analyze Patient"):
         "smoke_past": 1 if smoke_past == "Yes" else 0,
         "hiv_res": 1 if hiv == "Positive" else 0,
         "hist_rx": 1 if hist_rx == "Yes" else 0,
-        "xray_normal": 1 if xray_normal == "Normal" else 0,
-        "smear_pos": 1 if smear_pos == "Positive" else 0,
+        "xray_normal": 1 if xray == "Normal" else 0,
+        "smear_pos": 1 if smear == "Positive" else 0,
         "culture": 1 if culture == "Positive" else 0,
-        "bact": 1 if bact == "Positive" else 0,
+        "bact": 1 if genexpert == "Positive" else 0,
 
         # Categorical
         "region": region,
@@ -153,21 +174,18 @@ if st.button("Analyze Patient"):
         "occupation": OCCUPATION_MAP[occupation]
     }])
 
-    # ---------------- Model inference ----------------
+    # ========================================================
+    # ✅ LOAD TRAINED COMPONENTS
+    # ========================================================
     model, feature_names = load_ttvae()
     kmeans = load_cluster_model()
     ood_threshold = load_ood_threshold()
 
-    pre = build_preprocessor(
-        continuous_cols=["age_census", "cough_d", "fever_d", "wloss_d", "sputum_d"],
-        binary_cols=[c for c in input_df.columns if c not in
-                     ["age_census", "cough_d", "fever_d", "wloss_d", "sputum_d",
-                      "region", "married", "edu", "occupation"]],
-        categorical_cols=["region", "married", "edu", "occupation"]
-    )
+    # ✅ CRITICAL FIX: LOAD THE TRAINED PREPROCESSOR
+    preprocessor = joblib.load("preprocessor.pkl")
 
-    X = pre.fit_transform(input_df)
-    X = pd.DataFrame(X, columns=pre.get_feature_names_out())
+    X = preprocessor.transform(input_df)
+    X = pd.DataFrame(X, columns=preprocessor.get_feature_names_out())
     X = X.reindex(columns=feature_names, fill_value=0).values
 
     latent = compute_latent(model, X)
@@ -176,7 +194,9 @@ if st.button("Analyze Patient"):
     ood, recon_error = check_ood(model, X, ood_threshold)
     recon_error = float(np.squeeze(recon_error))
 
-    # ---------------- Results ----------------
+    # ========================================================
+    # RESULTS
+    # ========================================================
     st.header("Results")
 
     st.metric("TB Risk Score (Pseudotime)", f"{pseudotime:.2f}")
@@ -191,8 +211,15 @@ if st.button("Analyze Patient"):
     st.progress(pseudotime)
 
     st.subheader("Latent Phenotype")
-    st.write(cluster)
-    
+    st.write(f"**{cluster_info[cluster]['name']}**")
+    st.caption(cluster_info[cluster]["description"])
+
+    st.subheader("Reliability Assessment")
+    st.warning(
+        "⚠️ Input lies outside training distribution."
+        if ood else "✅ Input lies within training distribution."
+    )
+
     st.subheader("Model Confidence")
     st.write(f"Reconstruction Error: `{recon_error:.4f}`")
 
