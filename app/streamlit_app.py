@@ -30,29 +30,19 @@ st.caption(
 )
 
 # ============================================================
-# LATENT PHENOTYPE DEFINITIONS (FINAL)
+# LATENT PHENOTYPES
 # ============================================================
 cluster_info = {
-    0: {
-        "name": "Low-Symptom TB Risk",
-        "description": "Low symptom burden but still within the learned TB‑risk latent space."
-    },
-    1: {
-        "name": "Active Symptomatic TB",
-        "description": "High clinical symptom burden resembling active TB‑like presentation."
-    },
-    2: {
-        "name": "Minimal-Information Profile",
-        "description": "Sparse or weak feature activation due to limited diagnostic information."
-    },
-    3: {
-        "name": "Transitional TB Risk",
-        "description": "Intermediate phenotype between lower-risk and laboratory-confirmed profiles."
-    },
-    4: {
-        "name": "Laboratory-Confirmed TB",
-        "description": "Strong bacteriological and laboratory feature dominance."
-    }
+    0: {"name": "Low-Symptom TB Risk",
+        "description": "Low symptom burden but still within the learned TB-risk latent space."},
+    1: {"name": "Active Symptomatic TB",
+        "description": "High clinical symptom burden resembling active TB-like presentation."},
+    2: {"name": "Minimal-Information Profile",
+        "description": "Sparse or weak feature activation due to limited diagnostic information."},
+    3: {"name": "Transitional TB Risk",
+        "description": "Intermediate phenotype between lower-risk and laboratory-confirmed profiles."},
+    4: {"name": "Laboratory-Confirmed TB",
+        "description": "Strong bacteriological and laboratory feature dominance."}
 }
 
 # ============================================================
@@ -82,16 +72,12 @@ xray = st.selectbox("Chest X‑ray result", ["Normal", "Abnormal"])
 st.subheader("Laboratory (Optional)")
 smear = st.selectbox("Smear microscopy", ["Not done", "Negative", "Positive"])
 genexpert = st.selectbox("GeneXpert", ["Not done", "Negative", "Positive"])
-culture = st.selectbox("Culture", ["Not done", "Negative", "Positive"])
 
 # ============================================================
 # ANALYZE PATIENT
 # ============================================================
 if st.button("Analyze Patient"):
 
-    # -------------------------------
-    # Build input dataframe (1 row)
-    # -------------------------------
     input_df = pd.DataFrame([{
         "age_census": age,
         "sex_census": 1 if sex == "Male" else 2,
@@ -110,16 +96,10 @@ if st.button("Analyze Patient"):
         "bact": 1 if genexpert == "Positive" else 0
     }])
 
-    # -------------------------------
-    # Load trained components
-    # -------------------------------
     model, feature_names = load_ttvae()
     kmeans = load_cluster_model()
     ood_threshold = load_ood_threshold()
 
-    # -------------------------------
-    # Preprocessing
-    # -------------------------------
     pre = build_preprocessor(
         continuous_cols=["age_census"],
         binary_cols=[c for c in input_df.columns if c != "age_census"],
@@ -130,21 +110,13 @@ if st.button("Analyze Patient"):
     X = pd.DataFrame(X, columns=pre.get_feature_names_out())
     X = X.reindex(columns=feature_names, fill_value=0).values
 
-    # -------------------------------
-    # Inference
-    # -------------------------------
     latent = compute_latent(model, X)
 
     pseudotime = float(compute_pseudotime(latent)[0])
     cluster = int(assign_cluster(kmeans, latent)[0])
     ood_flag, recon_error = check_ood(model, X, ood_threshold)
-
-    # ✅ CRITICAL FIX
     recon_error = float(np.squeeze(recon_error))
 
-    # ========================================================
-    # RESULTS PANEL
-    # ========================================================
     st.header("Results")
 
     st.metric("TB Risk Score (Pseudotime)", f"{pseudotime:.2f}")
@@ -157,40 +129,25 @@ if st.button("Analyze Patient"):
         st.error("Risk Category: High Risk")
 
     st.progress(pseudotime)
-    st.caption(
-        "Continuous latent risk position approximating tuberculosis progression "
-        "derived from cross‑sectional observations."
-    )
 
     st.subheader("Latent Phenotype")
     st.write(f"**{cluster_info[cluster]['name']}**")
     st.caption(cluster_info[cluster]['description'])
 
     st.subheader("Reliability Assessment")
-    if ood_flag:
-        st.warning(
-            "⚠️ This patient profile lies outside the model’s training distribution. "
-            "Interpretation may be unreliable."
-        )
-    else:
-        st.success("✅ This patient profile lies within known training patterns.")
+    st.warning(
+        "⚠️ Input lies outside training distribution."
+        if ood_flag else "✅ Input lies within training distribution."
+    )
 
     st.subheader("Model Confidence")
     st.write(f"Reconstruction Error: `{recon_error:.4f}`")
-    st.caption(
-        "Lower error indicates better representation within the learned latent space."
-    )
 
 # ============================================================
-# SYNTHETIC DATA GENERATION (OBJECTIVE 6) — FIXED
+# SYNTHETIC DATA GENERATION (DECODED)
 # ============================================================
 st.divider()
 st.header("Synthetic Patient Generation")
-
-st.caption(
-    "The trained generative model samples the learned latent space to "
-    "generate realistic synthetic tuberculosis patient profiles."
-)
 
 num_samples = st.slider("Number of synthetic patients", 10, 100, 50)
 
@@ -199,32 +156,48 @@ if st.button("Generate Synthetic Patients"):
     model, feature_names = load_ttvae()
     device = next(model.parameters()).device
 
-    # ✅ Robust latent dimension inference
-    example_z = compute_latent(
-        model,
-        np.zeros((1, len(feature_names)))
-    )
+    example_z = compute_latent(model, np.zeros((1, len(feature_names))))
     latent_dim = example_z.shape[1]
 
     z = torch.randn(num_samples, latent_dim).to(device)
 
-    model.eval()
     with torch.no_grad():
         synthetic = model.decode(z).cpu().numpy()
 
-    syn_df = pd.DataFrame(synthetic, columns=feature_names)
+    syn = pd.DataFrame(synthetic, columns=feature_names)
 
-    st.success(f"Generated {num_samples} synthetic patient profiles")
-    st.dataframe(syn_df.head(10))
+    # ===========================
+    # ✅ DECODE SYNTHETIC DATA
+    # ===========================
+
+    decoded = pd.DataFrame()
+
+    # ---- Age (inverse scaling: assume 0–100)
+    decoded["age_census"] = (syn["cont__age_census"] * 100).round().astype(int)
+
+    # ---- Binary variables
+    bin_cols = [c for c in syn.columns if c.startswith("bin__")]
+    for col in bin_cols:
+        decoded[col.replace("bin__", "")] = (syn[col] >= 0.5).astype(int)
+
+    # ---- Region (one-hot)
+    region_cols = [c for c in syn.columns if c.startswith("cat__region")]
+    decoded["region"] = (
+        syn[region_cols].idxmax(axis=1).str.replace("cat__region_", "")
+    )
+
+    st.success(f"Generated {num_samples} decoded synthetic patients")
+
+    st.dataframe(decoded.head(10))
 
     st.download_button(
-        label="Download Synthetic Dataset (CSV)",
-        data=syn_df.to_csv(index=False),
-        file_name="synthetic_tb_patients.csv"
+        "Download Decoded Synthetic Dataset",
+        decoded.to_csv(index=False),
+        file_name="synthetic_tb_patients_decoded.csv"
     )
 
 st.divider()
 st.caption(
-    "This prototype provides latent risk stratification and phenotype profiling "
-    "based on unsupervised generative modeling. It does not replace clinical diagnosis."
+    "Synthetic data are generated in model feature space and decoded for clinical "
+    "interpretability. This system does not replace medical diagnosis."
 )
