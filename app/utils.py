@@ -1,8 +1,7 @@
-import os
-import json
 import torch
 import numpy as np
 import joblib
+import json
 
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
@@ -11,29 +10,11 @@ from sklearn.pipeline import Pipeline
 
 from ttvae_model import TTVAE
 
-# ============================================================
-# PATH HANDLING (CORRECT FOR YOUR REPO STRUCTURE)
-# ============================================================
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(APP_DIR)
-MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
-
 device = torch.device("cpu")
 
-# ============================================================
-# LOAD PSEUDOTIME REFERENCE BOUNDS
-# ============================================================
-PT_BOUNDS_PATH = os.path.join(MODELS_DIR, "pseudotime_bounds.json")
-
-with open(PT_BOUNDS_PATH, "r") as f:
-    _pt_bounds = json.load(f)
-
-_Z1_MIN = _pt_bounds["z1_min"]
-_Z1_MAX = _pt_bounds["z1_max"]
-
-# ============================================================
-# BUILD PREPROCESSOR (NO PICKLING)
-# ============================================================
+# -------------------------------------------------------------------
+# Runtime-safe preprocessing (NO pickling, NO version mismatch)
+# -------------------------------------------------------------------
 def build_preprocessor(continuous_cols, binary_cols, categorical_cols):
 
     cont_pipe = Pipeline([
@@ -61,39 +42,29 @@ def build_preprocessor(continuous_cols, binary_cols, categorical_cols):
         ("cat", cat_pipe, categorical_cols)
     ])
 
-# ============================================================
-# LOAD TRAINED TTVAE
-# ============================================================
-def load_ttvae():
-
-    feature_names_path = os.path.join(MODELS_DIR, "feature_names.json")
-    weights_path = os.path.join(MODELS_DIR, "ttvae_best.pth")
-
-    with open(feature_names_path, "r") as f:
-        feature_names = json.load(f)
-
-    D_in = len(feature_names)
-
-    model = TTVAE(D_in=D_in).to(device)
-    state = torch.load(weights_path, map_location=device)
+# -------------------------------------------------------------------
+# Load trained TTVAE model
+# -------------------------------------------------------------------
+def load_ttvae(input_dim):
+    model = TTVAE(input_dim=input_dim).to(device)
+    state = torch.load("models/ttvae_best.pth", map_location=device)
     model.load_state_dict(state)
     model.eval()
+    return model
 
-    return model, feature_names
+# -------------------------------------------------------------------
+# Metadata & auxiliary models
+# -------------------------------------------------------------------
+def load_feature_names():
+    with open("models/feature_names.json", "r") as f:
+        return json.load(f)
 
-# ============================================================
-# LOAD OTHER ARTIFACTS
-# ============================================================
 def load_cluster_model():
-    return joblib.load(os.path.join(MODELS_DIR, "kmeans_model.joblib"))
+    return joblib.load("models/kmeans_model.joblib")
 
-def load_ood_threshold():
-    with open(os.path.join(MODELS_DIR, "ood_threshold.json"), "r") as f:
-        return json.load(f)["ood_threshold"]
-
-# ============================================================
-# INFERENCE UTILITIES
-# ============================================================
+# -------------------------------------------------------------------
+# Inference utilities
+# -------------------------------------------------------------------
 def compute_latent(model, X):
     X_t = torch.tensor(X, dtype=torch.float32).to(device)
     with torch.no_grad():
@@ -102,18 +73,11 @@ def compute_latent(model, X):
 
 def compute_pseudotime(latents):
     """
-    Reference-normalized pseudotime.
-    Works for single patient and cohort analysis.
+    Cohort-based pseudotime (correct scientific use).
     """
     z1 = latents[:, 0]
-    return (z1 - _Z1_MIN) / (_Z1_MAX - _Z1_MIN + 1e-10)
-
-def check_ood(model, X, threshold):
-    X_t = torch.tensor(X, dtype=torch.float32).to(device)
-    with torch.no_grad():
-        rec, _, _ = model(X_t)
-    err = ((rec.cpu().numpy() - X) ** 2).mean(axis=1)
-    return err > threshold, err
+    pt = (z1 - z1.min()) / (z1.max() - z1.min() + 1e-10)
+    return np.clip(pt, 0.0, 1.0)
 
 def assign_cluster(kmeans, latents):
     return kmeans.predict(latents)
