@@ -43,10 +43,10 @@ def build_preprocessor(continuous_cols, binary_cols, categorical_cols):
     ])
 
 # ============================================================
-# Load trained TTVAE model
+# Load trained TTVAE model  ✅ FIXED (uses D_in)
 # ============================================================
 def load_ttvae(input_dim):
-    model = TTVAE(input_dim=input_dim).to(device)
+    model = TTVAE(D_in=input_dim).to(device)  # ✅ CORRECT ARG NAME
     state = torch.load("models/ttvae_best.pth", map_location=device)
     model.load_state_dict(state)
     model.eval()
@@ -66,9 +66,6 @@ def load_cluster_model():
 # Inference utilities
 # ============================================================
 def compute_latent(model, X):
-    """
-    Encode inputs into latent space (mu).
-    """
     X_t = torch.tensor(X, dtype=torch.float32).to(device)
     with torch.no_grad():
         mu, _ = model.encode(X_t)
@@ -76,15 +73,11 @@ def compute_latent(model, X):
 
 def compute_pseudotime(latents):
     """
-    Cohort-based pseudotime.
-    This is the scientifically correct usage.
+    Cohort-based pseudotime (correct usage).
     """
     z1 = latents[:, 0]
     pt = (z1 - z1.min()) / (z1.max() - z1.min() + 1e-10)
     return np.clip(pt, 0.0, 1.0)
 
 def assign_cluster(kmeans, latents):
-    """
-    Assign latent-space clusters.
-    """
     return kmeans.predict(latents)
