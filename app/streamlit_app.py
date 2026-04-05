@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -30,8 +29,7 @@ st.caption(
 )
 
 # ============================================================
-# PHENOTYPE (CLUSTER) LABELS
-# NOTE: These are POST-HOC INTERPRETATIVE LABELS
+# PHENOTYPE LABELS (POST‑HOC INTERPRETATION)
 # ============================================================
 CLUSTER_NAMES = {
     0: "Low‑Symptom TB Risk",
@@ -42,20 +40,28 @@ CLUSTER_NAMES = {
 }
 
 # ============================================================
-# EXPECTED FEATURE GROUPS (TRAINING CONSISTENT)
+# TRAINING FEATURE GROUPS (STRICT)
 # ============================================================
-continuous_cols = ["age_census", "cough_d", "fever_d", "wloss_d", "sputum_d"]
-
-binary_cols = [
-    "sex_census", "cough", "fever", "weight_loss", "night_sweats",
-    "chest_pain", "blood_sputum", "sputum",
-    "smoke_now", "smoke_past", "hiv_res", "hist_rx",
-    "xray_normal", "smear_pos", "culture", "cult_pos", "bact"
+continuous_cols = [
+    "age_census", "cough_d", "fever_d", "wloss_d",
+    "sputum_d", "tbhist_y", "tbtreat_w"
 ]
 
-categorical_cols = ["region", "married", "edu", "occupation"]
+binary_cols = [
+    "sex_census", "setting", "smoke_now", "smoke_past", "hiv_res",
+    "cough", "fever", "weight_loss", "night_sweats",
+    "chest_pain", "blood_sputum", "sputum", "hist_rx",
+    "current_rx", "xray_normal", "smear_pos",
+    "culture", "cult_pos", "bact"
+]
 
-EXPECTED_COLS = set(continuous_cols + binary_cols + categorical_cols)
+categorical_cols = [
+    "region", "married", "edu", "occupation",
+    "xrayres", "central_cxr_res",
+    "zn", "genexpert", "final_result"
+]
+
+EXPECTED_COLS = continuous_cols + binary_cols + categorical_cols
 
 # ============================================================
 # LOAD MODELS
@@ -69,110 +75,135 @@ kmeans = load_cluster_model()
 # ============================================================
 uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
 
-if uploaded_file is not None:
-
-    # --------------------------------------------------------
-    # Load & preview
-    # --------------------------------------------------------
-    df_raw = pd.read_csv(uploaded_file)
-
-    st.subheader("Uploaded Data Preview")
-    st.dataframe(df_raw.head())
-
-    # --------------------------------------------------------
-    # Handle missing columns (PDF behaviour)
-    # --------------------------------------------------------
-    present_cols = set(df_raw.columns)
-    missing_cols = sorted(list(EXPECTED_COLS - present_cols))
-
-    if missing_cols:
-        st.warning(
-            "The following expected columns were missing and ignored: "
-            + ", ".join(missing_cols)
-        )
-
-    # Keep only known columns
-    df = df_raw[[c for c in df_raw.columns if c in EXPECTED_COLS]].copy()
-
-    # --------------------------------------------------------
-    # Runtime preprocessing
-    # --------------------------------------------------------
-    pre = build_preprocessor(continuous_cols, binary_cols, categorical_cols)
-
-    # Dummy fit to initialise transformers
-    dummy_row = {c: 0 for c in continuous_cols + binary_cols}
-    dummy_row.update({c: "Unknown" for c in categorical_cols})
-    pre.fit(pd.DataFrame([dummy_row]))
-
-    X = pre.transform(df)
-    X = pd.DataFrame(X, columns=pre.get_feature_names_out())
-    X = X.reindex(columns=feature_names, fill_value=0).values
-
-    # --------------------------------------------------------
-    # Latent inference
-    # --------------------------------------------------------
-    latents = compute_latent(model, X)
-
-    # Pseudotime (cohort-based)
-    pseudotime = compute_pseudotime(latents)
-
-    # Clustering
-    cluster_ids = assign_cluster(kmeans, latents)
-    phenotypes = [CLUSTER_NAMES.get(c, f"Cluster {c}") for c in cluster_ids]
-
-    # --------------------------------------------------------
-    # Reconstruction error (OOD proxy)
-    # --------------------------------------------------------
-    X_t = torch.tensor(X, dtype=torch.float32)
-    with torch.no_grad():
-        rec, _, _ = model(X_t)
-    recon_error = ((rec.numpy() - X) ** 2).mean(axis=1)
-
-    # OOD flag (95th percentile rule)
-    ood_flag = recon_error > np.percentile(recon_error, 95)
-
-    # --------------------------------------------------------
-    # Patient-level results table (PDF style)
-    # --------------------------------------------------------
-    results = pd.DataFrame({
-        "pseudotime": pseudotime.round(4),
-        "cluster_id": cluster_ids,
-        "phenotype": phenotypes,
-        "OOD_flag": ood_flag,
-        "reconstruction_error": recon_error.round(4)
-    })
-
-    st.subheader("Patient-Level Results")
-    st.dataframe(results, use_container_width=True)
-
-    st.download_button(
-        "Download Results CSV",
-        results.to_csv(index=False),
-        file_name="ttvae_patient_results.csv",
-        mime="text/csv"
-    )
-
-    # --------------------------------------------------------
-    # Latent space visualization (PDF style)
-    # --------------------------------------------------------
-    st.subheader("Latent Space & Pseudotime")
-
-    fig, ax = plt.subplots(figsize=(6, 5))
-    sc = ax.scatter(
-        latents[:, 0],
-        latents[:, 1],
-        c=pseudotime,
-        cmap="plasma",
-        s=40
-    )
-    ax.set_xlabel("Latent Dimension 1 (z1)")
-    ax.set_ylabel("Latent Dimension 2 (z2)")
-    plt.colorbar(sc, ax=ax, label="Pseudotime")
-
-    st.pyplot(fig)
-
-else:
+if uploaded_file is None:
     st.info("Upload a cohort CSV file to begin analysis.")
+    st.stop()
+
+# ============================================================
+# LOAD & PREVIEW
+# ============================================================
+df = pd.read_csv(uploaded_file)
+
+st.subheader("Uploaded Data Preview")
+st.dataframe(df.head(), use_container_width=True)
+
+# ============================================================
+# HANDLE MISSING COLUMNS (CRITICAL FIX)
+# ============================================================
+present_cols = set(df.columns)
+missing_cols = [c for c in EXPECTED_COLS if c not in present_cols]
+
+if missing_cols:
+    st.warning(
+        "The following expected columns were missing and were "
+        "automatically filled with default values:\n\n"
+        + ", ".join(missing_cols)
+    )
+
+# ✅ Add missing columns safely
+for c in continuous_cols:
+    if c not in df.columns:
+        df[c] = 0.0
+
+for c in binary_cols:
+    if c not in df.columns:
+        df[c] = 0
+
+for c in categorical_cols:
+    if c not in df.columns:
+        df[c] = "Unknown"
+
+# ✅ Enforce correct column order
+df = df[EXPECTED_COLS]
+
+# ============================================================
+# PREPROCESSING (RUNTIME‑SAFE)
+# ============================================================
+pre = build_preprocessor(
+    continuous_cols=continuous_cols,
+    binary_cols=binary_cols,
+    categorical_cols=categorical_cols
+)
+
+# Dummy row to initialize encoders safely
+dummy = {c: 0 for c in continuous_cols + binary_cols}
+dummy.update({c: "Unknown" for c in categorical_cols})
+pre.fit(pd.DataFrame([dummy]))
+
+X = pre.transform(df)
+X = pd.DataFrame(X, columns=pre.get_feature_names_out())
+
+# Align exactly to training feature order
+X = X.reindex(columns=feature_names, fill_value=0).values
+
+# ============================================================
+# LATENT INFERENCE
+# ============================================================
+latents = compute_latent(model, X)
+
+# ============================================================
+# PSEUDOTIME (COHORT‑BASED)
+# ============================================================
+pseudotime = compute_pseudotime(latents)
+
+# ============================================================
+# CLUSTER ASSIGNMENT (LATENT SPACE)
+# ============================================================
+cluster_ids = assign_cluster(kmeans, latents)
+phenotypes = [CLUSTER_NAMES.get(c, f"Cluster {c}") for c in cluster_ids]
+
+# ============================================================
+# RECONSTRUCTION ERROR & OOD FLAG
+# ============================================================
+X_t = torch.tensor(X, dtype=torch.float32)
+with torch.no_grad():
+    rec, _, _ = model(X_t)
+
+rec_error = ((rec.numpy() - X) ** 2).mean(axis=1)
+ood_flag = rec_error > np.percentile(rec_error, 95)
+
+# ============================================================
+# PATIENT‑LEVEL RESULTS (PDF STYLE)
+# ============================================================
+results = pd.DataFrame({
+    "pseudotime": np.round(pseudotime, 4),
+    "cluster_id": cluster_ids,
+    "phenotype": phenotypes,
+    "OOD_flag": ood_flag,
+    "reconstruction_error": np.round(rec_error, 4)
+})
+
+st.subheader("Patient‑Level Results")
+st.dataframe(results, use_container_width=True)
+
+st.download_button(
+    "Download Results CSV",
+    results.to_csv(index=False),
+    file_name="ttvae_patient_results.csv",
+    mime="text/csv"
+)
+
+# ============================================================
+# LATENT SPACE PLOT (PDF STYLE)
+# ============================================================
+st.subheader("Latent Space & Pseudotime")
+
+fig, ax = plt.subplots(figsize=(6, 5))
+sc = ax.scatter(
+    latents[:, 0],
+    latents[:, 1],
+    c=pseudotime,
+    cmap="plasma",
+    s=40
+)
+ax.set_xlabel("Latent Dimension 1 (z1)")
+ax.set_ylabel("Latent Dimension 2 (z2)")
+plt.colorbar(sc, ax=ax, label="Pseudotime")
+
+st.pyplot(fig)
+
+
+
 # ============================================================
 # SYNTHETIC DATA GENERATION (DECODED)
 # ============================================================
