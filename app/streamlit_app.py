@@ -27,7 +27,7 @@ st.caption(
 )
 
 # ============================================================
-# LOAD MODELS & ARTIFACTS
+# LOAD MODELS & ARTIFACTS (ONCE)
 # ============================================================
 feature_names = load_feature_names()
 model = load_ttvae(input_dim=len(feature_names))
@@ -35,9 +35,6 @@ kmeans = load_cluster_model()
 
 with open("models/ood_threshold.json", "r") as f:
     OOD_THRESHOLD = json.load(f)["ood_threshold"]
-
-
-
 
 # ============================================================
 # PHENOTYPE DEFINITIONS
@@ -51,7 +48,7 @@ PHENOTYPE_INFO = {
 }
 
 # ============================================================
-# FEATURE GROUPS
+# FEATURE GROUPS (TRAINING CONSISTENT)
 # ============================================================
 continuous_cols = ["age_census","cough_d","fever_d","wloss_d","sputum_d","tbhist_y","tbtreat_w"]
 binary_cols = [
@@ -68,89 +65,138 @@ categorical_cols = [
 ALL_COLS = continuous_cols + binary_cols + categorical_cols
 
 # ============================================================
+# SAFETY SETTINGS
+# ============================================================
+MAX_ROWS = 30000          # Hard limit to prevent crashes
+BATCH_SIZE = 1024         # Safe PyTorch batch size
+
+# ============================================================
+# HELPER: BATCHED RECONSTRUCTION (CRITICAL)
+# ============================================================
+def batched_reconstruction_error(model, X, batch_size=BATCH_SIZE):
+    errors = []
+    model.eval()
+
+    with torch.no_grad():
+        for i in range(0, len(X), batch_size):
+            xb = torch.tensor(X[i:i+batch_size], dtype=torch.float32)
+            rec, _, _ = model(xb)
+            err = ((rec.numpy() - X[i:i+batch_size]) ** 2).mean(axis=1)
+            errors.append(err)
+
+    return np.concatenate(errors)
+
+# ============================================================
 # UPLOAD SECTION
 # ============================================================
 st.header("Upload Patient Cohort")
-uploaded_file = st.file_uploader("Upload a CSV file containing TB patient data", type=["csv"])
+uploaded_file = st.file_uploader(
+    "Upload a CSV file containing TB patient data", type=["csv"]
+)
 analyze = st.button("Analyze Cohort")
 
 results = None
 latents = pseudotime = clusters = None
 
 # ============================================================
-# ANALYSIS PIPELINE
+# ANALYSIS PIPELINE (WITH SAFETY)
 # ============================================================
 if uploaded_file and analyze:
 
-    df_raw = pd.read_csv(uploaded_file)
-    df = df_raw.copy()
+    try:
+        df_raw = pd.read_csv(uploaded_file)
 
-    # Silent missing column handling
-    for c in continuous_cols:
-        if c not in df.columns: df[c] = 0.0
-    for c in binary_cols:
-        if c not in df.columns: df[c] = 0
-    for c in categorical_cols:
-        if c not in df.columns: df[c] = "Unknown"
+        # ------------------------------
+        # INPUT SIZE GUARDRAIL
+        # ------------------------------
+        if len(df_raw) > MAX_ROWS:
+            st.error(
+                f"The uploaded dataset contains {len(df_raw):,} records.\n\n"
+                f"For stability, this deployment processes up to {MAX_ROWS:,} records per run.\n\n"
+                "Please upload a smaller cohort or split the dataset into batches."
+            )
+            st.stop()
 
-    df = df[ALL_COLS]
+        # ------------------------------
+        # PREPROCESSING
+        # ------------------------------
+        df = df_raw.copy()
 
-    pre = build_preprocessor(continuous_cols, binary_cols, categorical_cols)
-    dummy = {c:0 for c in continuous_cols + binary_cols}
-    dummy.update({c:"Unknown" for c in categorical_cols})
-    pre.fit(pd.DataFrame([dummy]))
+        for c in continuous_cols:
+            if c not in df.columns:
+                df[c] = 0.0
+        for c in binary_cols:
+            if c not in df.columns:
+                df[c] = 0
+        for c in categorical_cols:
+            if c not in df.columns:
+                df[c] = "Unknown"
 
-    X = pre.transform(df)
-    X = pd.DataFrame(X, columns=pre.get_feature_names_out())
-    X = X.reindex(columns=feature_names, fill_value=0).values
+        df = df[ALL_COLS]
 
-    latents = compute_latent(model, X)
-    pseudotime = compute_pseudotime(latents)
-    clusters = assign_cluster(kmeans, latents)
+        pre = build_preprocessor(continuous_cols, binary_cols, categorical_cols)
+        dummy = {c: 0 for c in continuous_cols + binary_cols}
+        dummy.update({c: "Unknown" for c in categorical_cols})
+        pre.fit(pd.DataFrame([dummy]))
 
-    def risk_bucket(pt):
-        if pt < 0.3: return "Low Risk"
-        if pt < 0.7: return "Moderate Risk"
-        return "High Risk"
+        X = pre.transform(df)
+        X = pd.DataFrame(X, columns=pre.get_feature_names_out())
+        X = X.reindex(columns=feature_names, fill_value=0).values
 
-    risk_category = [risk_bucket(p) for p in pseudotime]
+        # ------------------------------
+        # LATENT INFERENCE
+        # ------------------------------
+        latents = compute_latent(model, X)
+        pseudotime = compute_pseudotime(latents)
+        clusters = assign_cluster(kmeans, latents)
 
-    Xt = torch.tensor(X, dtype=torch.float32)
-    with torch.no_grad():
-        rec,_,_ = model(Xt)
+        def risk_bucket(pt):
+            if pt < 0.3:
+                return "Low Risk"
+            if pt < 0.7:
+                return "Moderate Risk"
+            return "High Risk"
 
-    #rec_error = ((rec.numpy() - X) ** 2).mean(axis=1)
-    #ood_flag = rec_error > OOD_THRESHOLD
-   # reliability = ["⚠️ OOD Warning" if f else "✅ In Distribution" for f in ood_flag]
+        risk_category = [risk_bucket(p) for p in pseudotime]
 
+        # ------------------------------
+        # RECONSTRUCTION + OOD (BATCHED)
+        # ------------------------------
+        rec_error = batched_reconstruction_error(model, X)
 
-    rec_error = ((rec.numpy() - X) ** 2).mean(axis=1)
+        # TEMPORARY: cohort-relative OOD (for screenshots / demo)
+        ood_flag = rec_error > np.percentile(rec_error, 95)
+        reliability = [
+            "⚠️ OOD Warning" if f else "✅ In Distribution" for f in ood_flag
+        ]
 
-    # TEMPORARY: cohort-relative OOD for visualization & screenshots
-    ood_flag = rec_error > np.percentile(rec_error, 95)
+        # ------------------------------
+        # RESULTS TABLE
+        # ------------------------------
+        results = pd.DataFrame({
+            "Pseudotime": np.round(pseudotime, 3),
+            "Risk Category": risk_category,
+            "Phenotype": [PHENOTYPE_INFO[c][0] for c in clusters],
+            "Reliability": reliability
+            #"Reconstruction Error": np.round(rec_error, 3)
+        })
 
-    reliability = ["⚠️ OOD Warning" if f else "✅ In Distribution" for f in ood_flag]
-
-
-
-    
-
-    results = pd.DataFrame({
-        "Pseudotime": np.round(pseudotime,3),
-        "Risk Category": risk_category,
-        "Phenotype": [PHENOTYPE_INFO[c][0] for c in clusters],
-        "Reliability": reliability,
-        "Reconstruction Error": np.round(rec_error,3)
-    })
+    except Exception:
+        st.error(
+            "The application encountered an error while processing the uploaded data.\n\n"
+            "This may be due to dataset size, extreme missingness, or incompatible values.\n\n"
+            "Please consider uploading a smaller cohort or cleaning the dataset."
+        )
+        st.stop()
 
 # ============================================================
-# MAIN CONTENT (ONLY IF ANALYZED)
+# MAIN CONTENT (ONLY IF ANALYSIS SUCCEEDED)
 # ============================================================
 if results is not None:
 
     st.header("Cohort Summary")
 
-    c1,c2,c3,c4 = st.columns(4)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total Patients", len(results))
     c2.metric("Average Pseudotime", f"{results['Pseudotime'].mean():.2f}")
     c3.metric("OOD Warnings", sum(results["Reliability"].str.contains("OOD")))
@@ -161,62 +207,61 @@ if results is not None:
 
     st.header("Data Interpretation")
 
-    # Latent plots
-    col1,col2 = st.columns(2)
+    col1, col2 = st.columns(2)
 
     with col1:
         st.subheader("Latent Space Colored by Phenotype")
-        fig,ax = plt.subplots(figsize=(4.5,4))
-        for cid,(name,_) in PHENOTYPE_INFO.items():
-            mask = clusters==cid
-            ax.scatter(latents[mask,0], latents[mask,1], label=name, alpha=0.6)
-        ax.set_xlabel("z1"); ax.set_ylabel("z2")
+        fig, ax = plt.subplots(figsize=(4.5, 4))
+        for cid, (name, _) in PHENOTYPE_INFO.items():
+            mask = clusters == cid
+            ax.scatter(latents[mask, 0], latents[mask, 1], label=name, alpha=0.6)
+        ax.set_xlabel("z1")
+        ax.set_ylabel("z2")
         ax.legend(fontsize=7)
         st.pyplot(fig)
 
     with col2:
         st.subheader("Latent Space Pseudotime Gradient")
-        fig,ax = plt.subplots(figsize=(4.5,4))
-        sc=ax.scatter(latents[:,0],latents[:,1],c=pseudotime,cmap="plasma")
-        ax.set_xlabel("z1"); ax.set_ylabel("z2")
-        plt.colorbar(sc,ax=ax)
+        fig, ax = plt.subplots(figsize=(4.5, 4))
+        sc = ax.scatter(latents[:, 0], latents[:, 1], c=pseudotime, cmap="plasma")
+        plt.colorbar(sc, ax=ax)
+        ax.set_xlabel("z1")
+        ax.set_ylabel("z2")
         st.pyplot(fig)
 
-    # Histograms row (SMALLER)
-    col3,col4 = st.columns(2)
+    col3, col4 = st.columns(2)
 
     with col3:
         st.subheader("Phenotype Distribution")
-        fig,ax=plt.subplots(figsize=(4,3))
-        results["Phenotype"].value_counts().plot(kind="bar",ax=ax)
+        fig, ax = plt.subplots(figsize=(4, 3))
+        results["Phenotype"].value_counts().plot(kind="bar", ax=ax)
         ax.set_ylabel("Count")
         st.pyplot(fig)
 
     with col4:
         st.subheader("Pseudotime Distribution")
-        fig,ax=plt.subplots(figsize=(4,3))
-        ax.hist(results["Pseudotime"],bins=15)
+        fig, ax = plt.subplots(figsize=(4, 3))
+        ax.hist(results["Pseudotime"], bins=15)
         ax.set_xlabel("Pseudotime")
         st.pyplot(fig)
 
-    # ========================================================
-    # DETAILED INTERPRETATION
-    # ========================================================
     st.header("Detailed Interpretation")
 
     with st.expander("Cluster‑Level Summary"):
         summary = results.groupby("Phenotype").agg(
-            Count=("Pseudotime","count"),
-            Mean_Pseudotime=("Pseudotime","mean"),
-            Mean_Reconstruction_Error=("Reconstruction Error","mean")
+            Count=("Pseudotime", "count"),
+            Mean_Pseudotime=("Pseudotime", "mean"),
+            Mean_Reconstruction_Error=("Reconstruction Error", "mean")
         ).reset_index()
         st.dataframe(summary)
 
     with st.expander("Cluster Feature Profiles"):
-        prof=df.copy()
-        prof["Cluster"]=clusters
-        profile_means=prof.groupby("Cluster").mean(numeric_only=True).reset_index()
-        profile_means["Phenotype"]=profile_means["Cluster"].map(lambda x:PHENOTYPE_INFO[x][0])
+        prof = df.copy()
+        prof["Cluster"] = clusters
+        profile_means = prof.groupby("Cluster").mean(numeric_only=True).reset_index()
+        profile_means["Phenotype"] = profile_means["Cluster"].map(
+            lambda x: PHENOTYPE_INFO[x][0]
+        )
         st.dataframe(profile_means)
         st.download_button(
             "Download Cluster Feature Profiles",
