@@ -206,6 +206,88 @@ if results is not None:
 
     st.caption("✅ = Out‑of‑Distribution detected  ⬜ = In‑distribution")
 
+
+
+# ============================================================
+# CLUSTER‑LEVEL SUMMARY
+# ============================================================
+st.divider()
+st.subheader("Cluster‑Level Summary")
+
+cluster_summary = (
+    results
+    .assign(Cluster=cluster_ids)
+    .groupby("Cluster")
+    .agg(
+        Count=("Pseudotime", "count"),
+        Mean_Pseudotime=("Pseudotime", "mean"),
+        Mean_Reconstruction_Error=("Reconstruction Error", "mean")
+    )
+    .reset_index()
+)
+
+# Map cluster names for readability
+cluster_summary["Phenotype"] = cluster_summary["Cluster"].map(CLUSTER_NAMES)
+
+# Reorder columns for clarity
+cluster_summary = cluster_summary[
+    ["Cluster", "Phenotype", "Count", "Mean_Pseudotime", "Mean_Reconstruction_Error"]
+]
+
+st.dataframe(
+    cluster_summary.style.format({
+        "Mean_Pseudotime": "{:.3f}",
+        "Mean_Reconstruction_Error": "{:.3f}"
+    }),
+    use_container_width=True
+)
+
+st.download_button(
+    "Download Cluster‑Level Summary CSV",
+    cluster_summary.to_csv(index=False),
+    file_name="cluster_level_summary.csv",
+    mime="text/csv"
+)
+
+# ============================================================
+# CLUSTER FEATURE PROFILES
+# ============================================================
+st.subheader("Cluster Feature Profiles")
+
+# Attach cluster IDs back to the original (decoded) feature table
+profile_df = df.copy()
+profile_df["Cluster"] = cluster_ids
+
+# Compute mean feature values per cluster
+cluster_profiles = (
+    profile_df
+    .groupby("Cluster")
+    .mean(numeric_only=True)
+    .reset_index()
+)
+
+# Add phenotype names
+cluster_profiles["Phenotype"] = cluster_profiles["Cluster"].map(CLUSTER_NAMES)
+
+# Move Phenotype column next to Cluster
+cols = ["Cluster", "Phenotype"] + [
+    c for c in cluster_profiles.columns if c not in ["Cluster", "Phenotype"]
+]
+cluster_profiles = cluster_profiles[cols]
+
+st.dataframe(cluster_profiles, use_container_width=True)
+
+st.download_button(
+    "Download Cluster Feature Profiles CSV",
+    cluster_profiles.to_csv(index=False),
+    file_name="cluster_feature_profiles.csv",
+    mime="text/csv"
+)
+
+
+
+
+
 # ============================================================
 # SYNTHETIC DATA GENERATION (ALWAYS VISIBLE)
 # ============================================================
