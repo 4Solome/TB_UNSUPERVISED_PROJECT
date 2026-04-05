@@ -1,18 +1,15 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import torch
-import json
 import matplotlib.pyplot as plt
 
 from utils import (
     build_preprocessor,
     load_ttvae,
+    load_feature_names,
     load_cluster_model,
-    load_ood_threshold,
     compute_latent,
     compute_pseudotime,
-    check_ood,
     assign_cluster
 )
 
@@ -23,19 +20,19 @@ st.set_page_config(page_title="TB Risk Profiling System", layout="centered")
 
 st.title("TB Risk Profiling System (TTVAE‑Based)")
 st.caption(
-    "Latent tuberculosis phenotype discovery and progression sequencing "
-    "using a Transformer‑based Tabular Variational Autoencoder."
+    "Cohort-based latent tuberculosis phenotyping and progression sequencing "
+    "using a Transformer-based Tabular Variational Autoencoder."
 )
 
 # ============================================================
-# PHENOTYPES
+# PHENOTYPE LABELS
 # ============================================================
-cluster_info = {
-    0: ("Low‑Symptom TB Risk", "Low symptom burden"),
-    1: ("Active Symptomatic TB", "High clinical symptom burden"),
-    2: ("Minimal‑Information Profile", "Sparse diagnostic information"),
-    3: ("Transitional TB Risk", "Intermediate phenotype"),
-    4: ("Laboratory‑Confirmed TB", "Strong bacteriological evidence")
+CLUSTER_NAMES = {
+    0: "Low‑Symptom TB Risk",
+    1: "Active Symptomatic TB",
+    2: "Minimal‑Information Profile",
+    3: "Transitional TB Risk",
+    4: "Laboratory‑Confirmed TB"
 }
 
 # ============================================================
@@ -43,121 +40,83 @@ cluster_info = {
 # ============================================================
 continuous_cols = ["age_census", "cough_d", "fever_d", "wloss_d", "sputum_d"]
 binary_cols = [
-    "sex_census","cough","fever","weight_loss","night_sweats",
-    "chest_pain","blood_sputum","sputum",
-    "smoke_now","smoke_past","hiv_res","hist_rx",
-    "xray_normal","smear_pos","culture","cult_pos","bact"
+    "sex_census", "cough", "fever", "weight_loss", "night_sweats",
+    "chest_pain", "blood_sputum", "sputum",
+    "smoke_now", "smoke_past", "hiv_res", "hist_rx",
+    "xray_normal", "smear_pos", "culture", "cult_pos", "bact"
 ]
-categorical_cols = ["region","married","edu","occupation"]
+categorical_cols = ["region", "married", "edu", "occupation"]
 
 # ============================================================
-# LOAD MODELS (SAFE)
+# LOAD MODELS
 # ============================================================
-@st.cache_resource
-def load_models():
-    model, feature_names = load_ttvae()
-    kmeans = load_cluster_model()
-    threshold = load_ood_threshold()
-    return model, kmeans, threshold, feature_names
-
-model, kmeans, threshold, feature_names = load_models()
+feature_names = load_feature_names()
+model = load_ttvae(input_dim=len(feature_names))
+kmeans = load_cluster_model()
 
 # ============================================================
-# INPUT MODE
+# COHORT CSV UPLOAD
 # ============================================================
-mode = st.radio("Select mode:", ["Single Patient", "Cohort (CSV Upload)"])
+st.header("Cohort Analysis (CSV Upload)")
 
-# ============================================================
-# SINGLE PATIENT MODE
-# ============================================================
-if mode == "Single Patient":
+uploaded_file = st.file_uploader("Upload CSV file", type=["csv"])
 
-    age = st.slider("Age", 0, 100, 35)
-    cough_d = st.number_input("Cough days", 0, 365, 0)
-    fever_d = st.number_input("Fever days", 0, 365, 0)
-    wloss_d = st.number_input("Weight loss days", 0, 2000, 0)
-    sputum_d = st.number_input("Sputum days", 0, 365, 0)
+if uploaded_file is not None:
 
-    input_df = pd.DataFrame([{
-        "age_census": age,
-        "cough_d": cough_d,
-        "fever_d": fever_d,
-        "wloss_d": wloss_d,
-        "sputum_d": sputum_d,
-        "sex_census": 1,
-        "cough": int(cough_d > 0),
-        "fever": int(fever_d > 0),
-        "weight_loss": int(wloss_d > 0),
-        "night_sweats": 0,
-        "chest_pain": 0,
-        "blood_sputum": 0,
-        "sputum": int(sputum_d > 0),
-        "smoke_now": 0,
-        "smoke_past": 0,
-        "hiv_res": 0,
-        "hist_rx": 0,
-        "xray_normal": 1,
-        "smear_pos": 0,
-        "culture": 0,
-        "cult_pos": 0,
-        "bact": 0,
-        "region": "Unknown",
-        "married": "Unknown",
-        "edu": "Unknown",
-        "occupation": "Unknown"
-    }])
+    df = pd.read_csv(uploaded_file)
+    st.subheader("Uploaded Data Preview")
+    st.dataframe(df.head())
 
+    # Check columns
+    required = continuous_cols + binary_cols + categorical_cols
+    missing = set(required) - set(df.columns)
+    if missing:
+        st.error(f"Missing required columns: {sorted(missing)}")
+        st.stop()
+
+    # Build & fit runtime-safe preprocessor
     pre = build_preprocessor(continuous_cols, binary_cols, categorical_cols)
+
     dummy = {c: 0 for c in continuous_cols + binary_cols}
     dummy.update({c: "Unknown" for c in categorical_cols})
     pre.fit(pd.DataFrame([dummy]))
 
-    X = pre.transform(input_df)
+    # Transform data
+    X = pre.transform(df)
     X = pd.DataFrame(X, columns=pre.get_feature_names_out())
     X = X.reindex(columns=feature_names, fill_value=0).values
 
+    # Latent inference
     latents = compute_latent(model, X)
-    pseudotime = float(np.clip(compute_pseudotime(latents)[0], 0, 1))
-    cluster = int(assign_cluster(kmeans, latents)[0])
-    recon = float(np.squeeze(check_ood(model, X, threshold)[1]))
 
-    st.metric("Pseudotime (reference-based)", f"{pseudotime:.2f}")
-    st.warning("Single-patient pseudotime is approximate")
-    st.write("Phenotype:", cluster_info[cluster][0])
-    st.write("Reconstruction error:", recon)
+    # Clustering & pseudotime
+    df["cluster_id"] = assign_cluster(kmeans, latents)
+    df["phenotype"] = df["cluster_id"].map(CLUSTER_NAMES)
+    df["pseudotime"] = compute_pseudotime(latents)
 
-# ============================================================
-# COHORT MODE
-# ============================================================
+    # ========================================================
+    # RESULTS
+    # ========================================================
+    st.subheader("Cohort Results")
+    st.dataframe(
+        df.sort_values("pseudotime", ascending=False),
+        use_container_width=True
+    )
+
+    st.subheader("Pseudotime Distribution")
+    fig, ax = plt.subplots()
+    ax.hist(df["pseudotime"], bins=20)
+    ax.set_xlabel("Pseudotime")
+    ax.set_ylabel("Number of Patients")
+    st.pyplot(fig)
+
+    st.caption(
+        "Pseudotime reflects relative progression along a latent TB risk axis "
+        "within the uploaded cohort."
+    )
+
 else:
-    file = st.file_uploader("Upload CSV", type=["csv"])
-    if file:
-        df = pd.read_csv(file)
-
-        pre = build_preprocessor(continuous_cols, binary_cols, categorical_cols)
-        dummy = {c: 0 for c in continuous_cols + binary_cols}
-        dummy.update({c: "Unknown" for c in categorical_cols})
-        pre.fit(pd.DataFrame([dummy]))
-
-        X = pre.transform(df)
-        X = pd.DataFrame(X, columns=pre.get_feature_names_out())
-        X = X.reindex(columns=feature_names, fill_value=0).values
-
-        latents = compute_latent(model, X)
-        z1 = latents[:, 0]
-        pseudotime = np.clip((z1 - z1.min()) / (z1.max() - z1.min() + 1e-10), 0, 1)
-        clusters = assign_cluster(kmeans, latents)
-
-        df["pseudotime"] = pseudotime
-        df["phenotype"] = [cluster_info[c][0] for c in clusters]
-
-        st.dataframe(df.sort_values("pseudotime", ascending=False))
-
-        fig, ax = plt.subplots()
-        ax.scatter(pseudotime, range(len(pseudotime)))
-        ax.set_xlabel("Pseudotime")
-        st.pyplot(fig)
-    
+    st.info("Upload a cohort CSV file to begin analysis.")
 # ============================================================
 # SYNTHETIC DATA GENERATION (DECODED)
 # ============================================================
