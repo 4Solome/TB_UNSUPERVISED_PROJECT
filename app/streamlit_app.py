@@ -36,6 +36,9 @@ kmeans = load_cluster_model()
 with open("models/ood_threshold.json", "r") as f:
     OOD_THRESHOLD = json.load(f)["ood_threshold"]
 
+
+
+
 # ============================================================
 # PHENOTYPE DEFINITIONS
 # ============================================================
@@ -116,9 +119,21 @@ if uploaded_file and analyze:
     with torch.no_grad():
         rec,_,_ = model(Xt)
 
+    #rec_error = ((rec.numpy() - X) ** 2).mean(axis=1)
+    #ood_flag = rec_error > OOD_THRESHOLD
+   # reliability = ["⚠️ OOD Warning" if f else "✅ In Distribution" for f in ood_flag]
+
+
     rec_error = ((rec.numpy() - X) ** 2).mean(axis=1)
-    ood_flag = rec_error > OOD_THRESHOLD
-    reliability = ["⚠️ OOD Warning" if f else "✅ In Distribution" for f in ood_flag]
+
+# TEMPORARY: cohort-relative OOD for visualization & screenshots
+ood_flag = rec_error > np.percentile(rec_error, 95)
+
+reliability = ["⚠️ OOD Warning" if f else "✅ In Distribution" for f in ood_flag]
+
+
+
+    
 
     results = pd.DataFrame({
         "Pseudotime": np.round(pseudotime,3),
