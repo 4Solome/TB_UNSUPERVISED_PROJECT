@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import torch
 
 from utils import (
     build_preprocessor,
@@ -10,33 +11,21 @@ from utils import (
     load_cluster_model,
     compute_latent,
     compute_pseudotime,
-    assign_cluster
 )
 
 # ============================================================
 # PAGE CONFIG
 # ============================================================
-st.set_page_config(page_title="TB Risk Profiling System", layout="centered")
+st.set_page_config(page_title="TTVAE Tuberculosis Risk Sequencer", layout="centered")
 
-st.title("TB Risk Profiling System (TTVAE‑Based)")
+st.title("TTVAE Tuberculosis Risk Sequencer")
 st.caption(
-    "Cohort-based latent tuberculosis phenotyping and progression sequencing "
-    "using a Transformer-based Tabular Variational Autoencoder."
+    "Upload a TB patient CSV to obtain pseudotime risk scores, "
+    "phenotype assignments, and reliability indicators."
 )
 
 # ============================================================
-# PHENOTYPE LABELS
-# ============================================================
-CLUSTER_NAMES = {
-    0: "Low‑Symptom TB Risk",
-    1: "Active Symptomatic TB",
-    2: "Minimal‑Information Profile",
-    3: "Transitional TB Risk",
-    4: "Laboratory‑Confirmed TB"
-}
-
-# ============================================================
-# TRAINING FEATURE GROUPS
+# CONFIGURATION
 # ============================================================
 continuous_cols = ["age_census", "cough_d", "fever_d", "wloss_d", "sputum_d"]
 binary_cols = [
@@ -55,65 +44,100 @@ model = load_ttvae(input_dim=len(feature_names))
 kmeans = load_cluster_model()
 
 # ============================================================
-# COHORT CSV UPLOAD
+# CSV UPLOAD
 # ============================================================
-st.header("Cohort Analysis (CSV Upload)")
-
-uploaded_file = st.file_uploader("Upload CSV file", type=["csv"])
+uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
 
 if uploaded_file is not None:
 
-    df = pd.read_csv(uploaded_file)
+    df_raw = pd.read_csv(uploaded_file)
+
+    # --------------------------------------------------------
+    # Preview
+    # --------------------------------------------------------
     st.subheader("Uploaded Data Preview")
-    st.dataframe(df.head())
+    st.dataframe(df_raw.head())
 
-    # Check columns
-    required = continuous_cols + binary_cols + categorical_cols
-    missing = set(required) - set(df.columns)
-    if missing:
-        st.error(f"Missing required columns: {sorted(missing)}")
-        st.stop()
+    # --------------------------------------------------------
+    # Handle missing columns (PDF behavior)
+    # --------------------------------------------------------
+    expected_cols = set(continuous_cols + binary_cols + categorical_cols)
+    present_cols = set(df_raw.columns)
 
-    # Build & fit runtime-safe preprocessor
+    missing_cols = sorted(list(expected_cols - present_cols))
+    if missing_cols:
+        st.warning(
+            "The following expected columns were missing and ignored: "
+            + ", ".join(missing_cols)
+        )
+
+    # Keep only known columns
+    df = df_raw[[c for c in df_raw.columns if c in expected_cols]].copy()
+
+    # --------------------------------------------------------
+    # Runtime preprocessing
+    # --------------------------------------------------------
     pre = build_preprocessor(continuous_cols, binary_cols, categorical_cols)
 
+    # Dummy fit to initialize transformers
     dummy = {c: 0 for c in continuous_cols + binary_cols}
     dummy.update({c: "Unknown" for c in categorical_cols})
     pre.fit(pd.DataFrame([dummy]))
 
-    # Transform data
     X = pre.transform(df)
     X = pd.DataFrame(X, columns=pre.get_feature_names_out())
     X = X.reindex(columns=feature_names, fill_value=0).values
 
+    # --------------------------------------------------------
     # Latent inference
+    # --------------------------------------------------------
     latents = compute_latent(model, X)
 
-    # Clustering & pseudotime
-    df["cluster_id"] = assign_cluster(kmeans, latents)
-    df["phenotype"] = df["cluster_id"].map(CLUSTER_NAMES)
-    df["pseudotime"] = compute_pseudotime(latents)
+    # Pseudotime & clustering
+    pseudotime = compute_pseudotime(latents)
+    cluster = kmeans.predict(latents)
 
-    # ========================================================
-    # RESULTS
-    # ========================================================
-    st.subheader("Cohort Results")
-    st.dataframe(
-        df.sort_values("pseudotime", ascending=False),
-        use_container_width=True
+    # Reconstruction error (OOD proxy)
+    X_t = torch.tensor(X, dtype=torch.float32)
+    with torch.no_grad():
+        rec, _, _ = model(X_t)
+    recon_error = ((rec.numpy() - X) ** 2).mean(axis=1)
+
+    # --------------------------------------------------------
+    # Patient‑level results table
+    # --------------------------------------------------------
+    results = pd.DataFrame({
+        "pseudotime": pseudotime.round(4),
+        "cluster": cluster,
+        "OOD_flag": recon_error > np.percentile(recon_error, 95),
+        "reconstruction_error": recon_error.round(4)
+    })
+
+    st.subheader("Patient‑Level Results")
+    st.dataframe(results)
+
+    st.download_button(
+        "Download Results CSV",
+        results.to_csv(index=False),
+        file_name="ttvae_results.csv",
+        mime="text/csv"
     )
 
-    st.subheader("Pseudotime Distribution")
-    fig, ax = plt.subplots()
-    ax.hist(df["pseudotime"], bins=20)
-    ax.set_xlabel("Pseudotime")
-    ax.set_ylabel("Number of Patients")
+    # --------------------------------------------------------
+    # Latent space visualization
+    # --------------------------------------------------------
+    st.subheader("Latent Space & Pseudotime")
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    sc = ax.scatter(
+        latents[:, 0], latents[:, 1],
+        c=pseudotime, cmap="plasma", s=40
+    )
+    ax.set_xlabel("Latent Dimension 1 (z1)")
+    ax.set_ylabel("Latent Dimension 2 (z2)")
+    plt.colorbar(sc, ax=ax, label="Pseudotime")
+
     st.pyplot(fig)
-
-    st.caption(
-        "Pseudotime reflects relative progression along a latent TB risk axis "
-        "within the uploaded cohort."
-    )
 
 else:
     st.info("Upload a cohort CSV file to begin analysis.")
