@@ -1,8 +1,11 @@
+import os
+import json
+import joblib
 import streamlit as st
 import pandas as pd
 import numpy as np
 import torch
-import json
+import matplotlib.pyplot as plt
 
 from utils import (
     build_preprocessor,
@@ -12,8 +15,14 @@ from utils import (
     compute_latent,
     compute_pseudotime,
     check_ood,
-    assign_cluster
 )
+
+# ============================================================
+# PATHS (MATCH YOUR REPO STRUCTURE)
+# ============================================================
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(APP_DIR)
+MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
 
 # ============================================================
 # PAGE CONFIG
@@ -22,28 +31,28 @@ st.set_page_config(page_title="TB Risk Profiling System", layout="centered")
 
 st.title("TB Risk Profiling System (TTVAE‑Based)")
 st.caption(
-    "Latent tuberculosis phenotype discovery and risk sequencing "
+    "Latent tuberculosis phenotype discovery and progression sequencing "
     "using a Transformer‑based Tabular Variational Autoencoder."
 )
 
 # ============================================================
-# CLUSTER LABELS
+# PHENOTYPE LABELS (FIXED)
 # ============================================================
 cluster_info = {
     0: ("Low‑Symptom TB Risk",
-        "Low symptom burden but within the learned TB‑risk space."),
+        "Low symptom burden within the learned TB‑risk space."),
     1: ("Active Symptomatic TB",
         "High clinical symptom burden consistent with active TB."),
     2: ("Minimal‑Information Profile",
-        "Sparse diagnostic information and weak signals."),
+        "Sparse diagnostic information with weak latent signals."),
     3: ("Transitional TB Risk",
-        "Mixed clinical features between early and confirmed TB profiles."),
+        "Intermediate phenotype between early and confirmed TB."),
     4: ("Laboratory‑Confirmed TB",
-        "Strong bacteriological and laboratory evidence.")
+        "Strong bacteriological and laboratory evidence of TB.")
 }
 
 # ============================================================
-# TRAINING FEATURE GROUPS
+# TRAINING FEATURE GROUPS (MUST MATCH TRAINING)
 # ============================================================
 continuous_cols = ["age_census", "cough_d", "fever_d", "wloss_d", "sputum_d"]
 binary_cols = [
@@ -55,16 +64,17 @@ binary_cols = [
 categorical_cols = ["region", "married", "edu", "occupation"]
 
 # ============================================================
-# LOAD MODELS ONCE
+# LOAD TRAINED ARTIFACTS (ONCE)
 # ============================================================
 @st.cache_resource
-def load_models():
+def load_artifacts():
     model, feature_names = load_ttvae()
     kmeans = load_cluster_model()
     threshold = load_ood_threshold()
-    return model, kmeans, threshold, feature_names
+    preprocessor = joblib.load(os.path.join(MODELS_DIR, "preprocessor.pkl"))
+    return model, kmeans, threshold, feature_names, preprocessor
 
-model, kmeans, threshold, feature_names = load_models()
+model, kmeans, threshold, feature_names, trained_preprocessor = load_artifacts()
 
 # ============================================================
 # INPUT MODE SELECTION
@@ -76,7 +86,7 @@ mode = st.radio(
 )
 
 # ============================================================
-# MODE 1 — SINGLE PATIENT
+# MODE 1 — SINGLE PATIENT (REFERENCE‑BASED)
 # ============================================================
 if mode == "Single Patient":
 
@@ -86,16 +96,22 @@ if mode == "Single Patient":
     age = st.slider("Age (years)", 0, 100, 35)
     sex = st.selectbox("Sex", ["Male", "Female"])
     region = st.selectbox("Region", ["Central", "East", "North", "West"])
-    married = st.selectbox("Marital status",
-                           ["Single", "Married", "Separated", "Divorced",
-                            "Widowed", "Don't know", "Unknown"])
-    education = st.selectbox("Education level",
-                             ["None", "Primary", "Senior 1–4", "Senior 5–6",
-                              "Tertiary", "Don't know", "Unknown"])
-    occupation = st.selectbox("Occupation",
-                              ["Business", "Civil servant", "Healthcare worker", "Student",
-                               "Unemployed", "Farmer", "House wife/husband",
-                               "Skilled labor", "Other"])
+    married = st.selectbox(
+        "Marital status",
+        ["Single", "Married", "Separated", "Divorced",
+         "Widowed", "Don't know", "Unknown"]
+    )
+    education = st.selectbox(
+        "Education level",
+        ["None", "Primary", "Senior 1–4", "Senior 5–6",
+         "Tertiary", "Don't know", "Unknown"]
+    )
+    occupation = st.selectbox(
+        "Occupation",
+        ["Business", "Civil servant", "Healthcare worker", "Student",
+         "Unemployed", "Farmer", "House wife/husband",
+         "Skilled labor", "Other"]
+    )
 
     # --- Symptoms
     st.subheader("Symptoms")
@@ -115,8 +131,7 @@ if mode == "Single Patient":
     chest_pain = st.checkbox("Chest pain")
     blood_sputum = st.checkbox("Blood‑stained sputum")
 
-    # --- Labs
-    st.subheader("Laboratory")
+    # --- Lab
     xray = st.selectbox("Chest X‑ray", ["Normal", "Abnormal"])
     smear = st.selectbox("Smear microscopy", ["Negative", "Positive"])
     culture = st.selectbox("Culture", ["Negative", "Positive"])
@@ -155,101 +170,79 @@ if mode == "Single Patient":
             "occupation": occupation
         }])
 
-        pre = build_preprocessor(continuous_cols, binary_cols, categorical_cols)
-
-        dummy = {c: 0 for c in continuous_cols + binary_cols}
-        dummy.update({c: "Unknown" for c in categorical_cols})
-        pre.fit(pd.DataFrame([dummy]))
-
-        X = pre.transform(input_df)
-        X = pd.DataFrame(X, columns=pre.get_feature_names_out())
+        X = trained_preprocessor.transform(input_df)
+        X = pd.DataFrame(X, columns=trained_preprocessor.get_feature_names_out())
         X = X.reindex(columns=feature_names, fill_value=0).values
 
         latents = compute_latent(model, X)
-        pseudotime = float(compute_pseudotime(latents)[0])
-        cluster = int(assign_cluster(kmeans, latents)[0])
+        pseudotime = float(np.clip(compute_pseudotime(latents)[0], 0.0, 1.0))
+        cluster = int(kmeans.predict(latents)[0])
         recon = float(np.squeeze(check_ood(model, X, threshold)[1]))
 
         st.subheader("Results")
-        st.write("⚠️ *Single-patient pseudotime is reference-based and may appear low.*")
-        st.metric("Pseudotime (reference-based)", f"{pseudotime:.2f}")
+        st.warning(
+            "Single‑patient pseudotime is reference‑based and may appear low. "
+            "Cohort analysis provides stable progression ordering."
+        )
+
+        st.metric("Pseudotime (reference‑based)", f"{pseudotime:.2f}")
 
         name, desc = cluster_info[cluster]
-        st.subheader("Phenotype")
+        st.subheader("Phenotype (approximate)")
         st.write(f"**{name}**")
         st.caption(desc)
 
         st.write(f"Reconstruction Error: `{recon:.2f}`")
 
 # ============================================================
-# MODE 2 — CSV COHORT (TRUE PSEUDOTIME)
+# MODE 2 — CSV COHORT (TRUE PSEUDOTIME + CLUSTERING)
 # ============================================================
 else:
     st.header("Cohort Analysis (CSV Upload)")
 
-    # ✅ DEFINE file FIRST (this was missing)
-    uploaded_file = st.file_uploader(
-        "Upload CSV file for cohort analysis",
-        type=["csv"]
-    )
+    uploaded_file = st.file_uploader("Upload CSV file", type=["csv"])
 
     if uploaded_file is None:
-        st.info("Please upload a CSV file to run cohort-based pseudotime analysis.")
+        st.info("Upload a CSV file to compute cohort‑based pseudotime and phenotypes.")
     else:
         df = pd.read_csv(uploaded_file)
 
-        st.subheader("Uploaded CSV Preview")
+        st.subheader("CSV Preview")
         st.dataframe(df.head())
 
-        # ✅ Check required columns
         required_cols = continuous_cols + binary_cols + categorical_cols
         missing = set(required_cols) - set(df.columns)
 
         if missing:
-            st.error(f"Missing required columns in CSV: {sorted(missing)}")
+            st.error(f"Missing required columns: {sorted(missing)}")
             st.stop()
 
-        # Build preprocessor
-        pre = build_preprocessor(
-            continuous_cols,
-            binary_cols,
-            categorical_cols
-        )
-
-        # Dummy fit (same as single-patient mode)
-        dummy = {}
-        for c in continuous_cols:
-            dummy[c] = 0.0
-        for c in binary_cols:
-            dummy[c] = 0
-        for c in categorical_cols:
-            dummy[c] = "Unknown"
-
-        pre.fit(pd.DataFrame([dummy]))
-
-        # Transform cohort
-        X = pre.transform(df)
-        X = pd.DataFrame(X, columns=pre.get_feature_names_out())
-
-        with open("models/feature_names.json") as f:
-            feature_names = json.load(f)
-
+        # ✅ USE TRAINING PREPROCESSOR (THIS FIXES PHENOTYPES)
+        X = trained_preprocessor.transform(df)
+        X = pd.DataFrame(X, columns=trained_preprocessor.get_feature_names_out())
         X = X.reindex(columns=feature_names, fill_value=0).values
 
-        # Latent inference
         latents = compute_latent(model, X)
 
-        # ✅ TRUE cohort-based pseudotime
+        # ✅ TRUE COHORT PSEUDOTIME
         z1 = latents[:, 0]
         pseudotime = (z1 - z1.min()) / (z1.max() - z1.min() + 1e-10)
+        pseudotime = np.clip(pseudotime, 0.0, 1.0)
 
-        clusters = assign_cluster(kmeans, latents)
+        clusters = kmeans.predict(latents)
 
         df["pseudotime"] = pseudotime
         df["phenotype"] = [cluster_info[c][0] for c in clusters]
 
         st.subheader("Cohort Results")
-        st.dataframe(df.sort_values("pseudotime", ascending=False))
+        st.dataframe(df.sort_values("pseudotime", ascending=False), use_container_width=True)
+
+        st.subheader("Pseudotime Distribution")
+        fig, ax = plt.subplots()
+        ax.hist(df["pseudotime"], bins=20)
+        ax.set_xlabel("Pseudotime")
+        ax.set_ylabel("Number of patients")
+        st.pyplot(fig)
 
         st.caption(
             "Pseudotime here reflects true relative progression across the uploaded cohort."
