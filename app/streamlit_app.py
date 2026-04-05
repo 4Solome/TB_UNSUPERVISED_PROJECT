@@ -232,19 +232,66 @@ if results is not None:
 # ============================================================
 st.header("Synthetic Patient Generation")
 
-num_samples=st.slider("Number of synthetic patients",10,200,50)
+
+# ============================================================
+# SYNTHETIC DATA GENERATION (DECODED)
+# ============================================================
+st.divider()
+st.header("Synthetic Patient Generation")
+
+num_samples = st.slider("Number of synthetic patients", 10, 100, 50)
 
 if st.button("Generate Synthetic Patients"):
-    z=torch.randn(num_samples,32)
+
+    model, feature_names = load_ttvae()
+    device = next(model.parameters()).device
+
+    example_z = compute_latent(model, np.zeros((1, len(feature_names))))
+    latent_dim = example_z.shape[1]
+
+    z = torch.randn(num_samples, latent_dim).to(device)
+
     with torch.no_grad():
-        synth=model.decode(z).numpy()
-    synth_df=pd.DataFrame(synth,columns=feature_names)
-    st.dataframe(synth_df.head())
-    st.download_button(
-        "Download Synthetic Dataset",
-        synth_df.to_csv(index=False),
-        file_name="synthetic_patients.csv"
+        synthetic = model.decode(z).cpu().numpy()
+
+    syn = pd.DataFrame(synthetic, columns=feature_names)
+
+    # ===========================
+    # ✅ DECODE SYNTHETIC DATA
+    # ===========================
+
+    decoded = pd.DataFrame()
+
+    # ---- Age (inverse scaling: assume 0–100)
+    decoded["age_census"] = (syn["cont__age_census"] * 100).round().astype(int)
+
+    # ---- Binary variables
+    bin_cols = [c for c in syn.columns if c.startswith("bin__")]
+    for col in bin_cols:
+        decoded[col.replace("bin__", "")] = (syn[col] >= 0.5).astype(int)
+
+    # ---- Region (one-hot)
+    region_cols = [c for c in syn.columns if c.startswith("cat__region")]
+    decoded["region"] = (
+        syn[region_cols].idxmax(axis=1).str.replace("cat__region_", "")
     )
+
+    st.success(f"Generated {num_samples} decoded synthetic patients")
+
+    st.dataframe(decoded.head(10))
+
+    st.download_button(
+        "Download Decoded Synthetic Dataset",
+        decoded.to_csv(index=False),
+        file_name="synthetic_tb_patients_decoded.csv"
+    )
+
+st.divider()
+st.caption(
+    "Synthetic data are generated in model feature space and decoded for clinical "
+    "interpretability. This system does not replace medical diagnosis."
+)
+
 
 st.caption(
     "This system supports tuberculosis risk profiling for research purposes "
