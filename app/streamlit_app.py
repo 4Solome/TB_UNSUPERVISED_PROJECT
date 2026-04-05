@@ -227,11 +227,6 @@ if results is not None:
     with st.expander("View Uploaded Data Preview"):
         st.dataframe(df_raw.head(200))
 
-# ============================================================
-# SYNTHETIC DATA GENERATION (ALWAYS VISIBLE)
-# ============================================================
-st.header("Synthetic Patient Generation")
-
 
 # ============================================================
 # SYNTHETIC DATA GENERATION (DECODED, INTERPRETABLE)
