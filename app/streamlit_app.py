@@ -1,146 +1,95 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
 import torch
+import numpy as np
+import joblib
+import json
 
-from utils import (
-    build_preprocessor,
-    load_ttvae,
-    load_feature_names,
-    load_cluster_model,
-    compute_latent,
-    compute_pseudotime,
-)
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
 
-# ============================================================
-# PAGE CONFIG
-# ============================================================
-st.set_page_config(page_title="TTVAE Tuberculosis Risk Sequencer", layout="centered")
+from ttvae_model import TTVAE
 
-st.title("TTVAE Tuberculosis Risk Sequencer")
-st.caption(
-    "Upload a TB patient CSV to obtain pseudotime risk scores, "
-    "phenotype assignments, and reliability indicators."
-)
+device = torch.device("cpu")
 
 # ============================================================
-# CONFIGURATION
+# Runtime-safe preprocessing (NO pickling, NO version mismatch)
 # ============================================================
-continuous_cols = ["age_census", "cough_d", "fever_d", "wloss_d", "sputum_d"]
-binary_cols = [
-    "sex_census", "cough", "fever", "weight_loss", "night_sweats",
-    "chest_pain", "blood_sputum", "sputum",
-    "smoke_now", "smoke_past", "hiv_res", "hist_rx",
-    "xray_normal", "smear_pos", "culture", "cult_pos", "bact"
-]
-categorical_cols = ["region", "married", "edu", "occupation"]
+def build_preprocessor(continuous_cols, binary_cols, categorical_cols):
+
+    cont_pipe = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", MinMaxScaler())
+    ])
+
+    bin_pipe = Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent"))
+    ])
+
+    try:
+        ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+    except TypeError:
+        ohe = OneHotEncoder(handle_unknown="ignore", sparse=False)
+
+    cat_pipe = Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("encoder", ohe)
+    ])
+
+    return ColumnTransformer([
+        ("cont", cont_pipe, continuous_cols),
+        ("bin", bin_pipe, binary_cols),
+        ("cat", cat_pipe, categorical_cols)
+    ])
 
 # ============================================================
-# LOAD MODELS
+# Load trained TTVAE model (CORRECT SIGNATURE)
 # ============================================================
-feature_names = load_feature_names()
-model = load_ttvae(input_dim=len(feature_names))
-kmeans = load_cluster_model()
+def load_ttvae(input_dim):
+    model = TTVAE(D_in=input_dim).to(device)
+    state = torch.load("models/ttvae_best.pth", map_location=device)
+    model.load_state_dict(state)
+    model.eval()
+    return model
 
 # ============================================================
-# CSV UPLOAD
+# Metadata & auxiliary models
 # ============================================================
-uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
+def load_feature_names():
+    with open("models/feature_names.json", "r") as f:
+        return json.load(f)
 
-if uploaded_file is not None:
+def load_cluster_model():
+    return joblib.load("models/kmeans_model.joblib")
 
-    df_raw = pd.read_csv(uploaded_file)
-
-    # --------------------------------------------------------
-    # Preview
-    # --------------------------------------------------------
-    st.subheader("Uploaded Data Preview")
-    st.dataframe(df_raw.head())
-
-    # --------------------------------------------------------
-    # Handle missing columns (PDF behavior)
-    # --------------------------------------------------------
-    expected_cols = set(continuous_cols + binary_cols + categorical_cols)
-    present_cols = set(df_raw.columns)
-
-    missing_cols = sorted(list(expected_cols - present_cols))
-    if missing_cols:
-        st.warning(
-            "The following expected columns were missing and ignored: "
-            + ", ".join(missing_cols)
-        )
-
-    # Keep only known columns
-    df = df_raw[[c for c in df_raw.columns if c in expected_cols]].copy()
-
-    # --------------------------------------------------------
-    # Runtime preprocessing
-    # --------------------------------------------------------
-    pre = build_preprocessor(continuous_cols, binary_cols, categorical_cols)
-
-    # Dummy fit to initialize transformers
-    dummy = {c: 0 for c in continuous_cols + binary_cols}
-    dummy.update({c: "Unknown" for c in categorical_cols})
-    pre.fit(pd.DataFrame([dummy]))
-
-    X = pre.transform(df)
-    X = pd.DataFrame(X, columns=pre.get_feature_names_out())
-    X = X.reindex(columns=feature_names, fill_value=0).values
-
-    # --------------------------------------------------------
-    # Latent inference
-    # --------------------------------------------------------
-    latents = compute_latent(model, X)
-
-    # Pseudotime & clustering
-    pseudotime = compute_pseudotime(latents)
-    cluster = kmeans.predict(latents)
-
-    # Reconstruction error (OOD proxy)
-    X_t = torch.tensor(X, dtype=torch.float32)
+# ============================================================
+# Inference utilities
+# ============================================================
+def compute_latent(model, X):
+    """
+    Encode tabular features into latent space (mu).
+    """
+    X_t = torch.tensor(X, dtype=torch.float32).to(device)
     with torch.no_grad():
-        rec, _, _ = model(X_t)
-    recon_error = ((rec.numpy() - X) ** 2).mean(axis=1)
+        mu, _ = model.encode(X_t)
+    return mu.cpu().numpy()
 
-    # --------------------------------------------------------
-    # Patient‑level results table
-    # --------------------------------------------------------
-    results = pd.DataFrame({
-        "pseudotime": pseudotime.round(4),
-        "cluster": cluster,
-        "OOD_flag": recon_error > np.percentile(recon_error, 95),
-        "reconstruction_error": recon_error.round(4)
-    })
+def compute_pseudotime(latents):
+    """
+    Cohort-based pseudotime (true use).
+    Normalized z1 across the uploaded cohort.
+    """
+    z1 = latents[:, 0]
+    pt = (z1 - z1.min()) / (z1.max() - z1.min() + 1e-10)
+    return np.clip(pt, 0.0, 1.0)
 
-    st.subheader("Patient‑Level Results")
-    st.dataframe(results)
+def assign_cluster(kmeans, latents):
+    """
+    Assign latent-space clusters.
+    """
+    return kmeans.predict(latents)
 
-    st.download_button(
-        "Download Results CSV",
-        results.to_csv(index=False),
-        file_name="ttvae_results.csv",
-        mime="text/csv"
-    )
 
-    # --------------------------------------------------------
-    # Latent space visualization
-    # --------------------------------------------------------
-    st.subheader("Latent Space & Pseudotime")
-
-    fig, ax = plt.subplots(figsize=(6, 5))
-    sc = ax.scatter(
-        latents[:, 0], latents[:, 1],
-        c=pseudotime, cmap="plasma", s=40
-    )
-    ax.set_xlabel("Latent Dimension 1 (z1)")
-    ax.set_ylabel("Latent Dimension 2 (z2)")
-    plt.colorbar(sc, ax=ax, label="Pseudotime")
-
-    st.pyplot(fig)
-
-else:
-    st.info("Upload a cohort CSV file to begin analysis.")
 # ============================================================
 # SYNTHETIC DATA GENERATION (DECODED)
 # ============================================================
