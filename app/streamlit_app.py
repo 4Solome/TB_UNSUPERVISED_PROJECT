@@ -76,7 +76,7 @@ kmeans = load_cluster_model()
 st.header("Cohort Analysis (CSV Upload)")
 uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
 
-results = None  # will hold final results if CSV is provided
+results = None  # Will hold final results if CSV is provided
 
 # ============================================================
 # COHORT ANALYSIS
@@ -89,7 +89,7 @@ if uploaded_file is not None:
     st.dataframe(df.head(), use_container_width=True)
 
     # --------------------------------------------------------
-    # SILENTLY HANDLE MISSING COLUMNS (NO WARNINGS)
+    # SILENTLY HANDLE MISSING COLUMNS
     # --------------------------------------------------------
     for c in continuous_cols:
         if c not in df.columns:
@@ -141,8 +141,10 @@ if uploaded_file is not None:
     rec_error = ((rec.numpy() - X) ** 2).mean(axis=1)
     ood_flag = rec_error > np.percentile(rec_error, 95)
 
-    # Convert OOD flag to icons
-    ood_icon = ["❌" if flag else "✅" for flag in ood_flag]
+    # ✅ Display rule:
+    # ✅  -> OOD detected
+    # ⬜ -> In-distribution
+    ood_display = ["✅" if flag else "⬜" for flag in ood_flag]
 
     # --------------------------------------------------------
     # RESULTS TABLE
@@ -150,7 +152,7 @@ if uploaded_file is not None:
     results = pd.DataFrame({
         "Pseudotime": np.round(pseudotime, 4),
         "Phenotype": phenotypes,
-        "OOD": ood_icon,
+        "OOD": ood_display,
         "Reconstruction Error": np.round(rec_error, 4)
     })
 
@@ -183,7 +185,7 @@ if uploaded_file is not None:
     st.pyplot(fig)
 
 # ============================================================
-# RESULTS SUMMARY BOX ✅
+# RESULTS SUMMARY BOX
 # ============================================================
 if results is not None:
 
@@ -192,15 +194,17 @@ if results is not None:
 
     total = len(results)
     avg_pt = results["Pseudotime"].mean()
-    n_ood = sum(results["OOD"] == "❌")
+    n_ood = sum(results["OOD"] == "✅")
     unique_pheno = results["Phenotype"].nunique()
 
     col1, col2, col3, col4 = st.columns(4)
 
     col1.metric("Total Patients", total)
     col2.metric("Average Pseudotime", f"{avg_pt:.2f}")
-    col3.metric("Out‑of‑Distribution", f"{n_ood}")
+    col3.metric("OOD Detected", n_ood)
     col4.metric("Phenotypes Detected", unique_pheno)
+
+    st.caption("✅ = Out‑of‑Distribution detected  ⬜ = In‑distribution")
 
 # ============================================================
 # SYNTHETIC DATA GENERATION (ALWAYS VISIBLE)
@@ -233,7 +237,9 @@ if st.button("Generate Synthetic Patients"):
         decoded[col.replace("bin__", "")] = (syn[col] >= 0.5).astype(int)
 
     region_cols = [c for c in syn.columns if c.startswith("cat__region")]
-    decoded["region"] = syn[region_cols].idxmax(axis=1).str.replace("cat__region_", "")
+    decoded["region"] = syn[region_cols].idxmax(axis=1).str.replace(
+        "cat__region_", ""
+    )
 
     st.success(f"Generated {num_samples} synthetic patients")
     st.dataframe(decoded.head(10), use_container_width=True)
@@ -247,56 +253,6 @@ if st.button("Generate Synthetic Patients"):
 
 st.caption(
     "Synthetic data are generated in model feature space and decoded for "
-    "approximate clinical interpretability only. This system does not replace "
-    "medical diagnosis."
-)
-
-
-
-# ============================================================
-# SYNTHETIC DATA GENERATION (ALWAYS VISIBLE ✅)
-# ============================================================
-st.divider()
-st.header("Synthetic Patient Generation")
-
-num_samples = st.slider(
-    "Number of synthetic patients",
-    min_value=10,
-    max_value=200,
-    value=50
-)
-
-if st.button("Generate Synthetic Patients"):
-
-    latent_dim = 32  # from training
-    z = torch.randn(num_samples, latent_dim)
-
-    with torch.no_grad():
-        synthetic = model.decode(z).numpy()
-
-    syn = pd.DataFrame(synthetic, columns=feature_names)
-
-    decoded = pd.DataFrame()
-    decoded["age_census"] = (syn["cont__age_census"] * 100).round().astype(int)
-
-    bin_cols = [c for c in syn.columns if c.startswith("bin__")]
-    for col in bin_cols:
-        decoded[col.replace("bin__", "")] = (syn[col] >= 0.5).astype(int)
-
-    region_cols = [c for c in syn.columns if c.startswith("cat__region")]
-    decoded["region"] = syn[region_cols].idxmax(axis=1).str.replace("cat__region_", "")
-
-    st.success(f"Generated {num_samples} synthetic patients")
-    st.dataframe(decoded.head(10), use_container_width=True)
-
-    st.download_button(
-        "Download Decoded Synthetic Dataset",
-        decoded.to_csv(index=False),
-        file_name="synthetic_tb_patients.csv",
-        mime="text/csv"
-    )
-
-st.caption(
-    "Synthetic data are generated in model feature space and decoded for "
-    "approximate clinical interpretability only."
+    "approximate clinical interpretability only. "
+    "This system does not replace medical diagnosis."
 )
