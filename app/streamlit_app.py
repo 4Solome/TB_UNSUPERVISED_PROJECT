@@ -76,8 +76,10 @@ kmeans = load_cluster_model()
 st.header("Cohort Analysis (CSV Upload)")
 uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
 
+results = None  # will hold final results if CSV is provided
+
 # ============================================================
-# COHORT ANALYSIS (ONLY IF CSV PROVIDED)
+# COHORT ANALYSIS
 # ============================================================
 if uploaded_file is not None:
 
@@ -86,29 +88,26 @@ if uploaded_file is not None:
     st.subheader("Uploaded Data Preview")
     st.dataframe(df.head(), use_container_width=True)
 
-    # ------------------ Missing column handling ------------------
-    present_cols = set(df.columns)
-    missing_cols = [c for c in EXPECTED_COLS if c not in present_cols]
-
-    if missing_cols:
-        st.warning(
-            "The following expected columns were missing and filled with defaults:\n\n"
-            + ", ".join(missing_cols)
-        )
-
+    # --------------------------------------------------------
+    # SILENTLY HANDLE MISSING COLUMNS (NO WARNINGS)
+    # --------------------------------------------------------
     for c in continuous_cols:
         if c not in df.columns:
             df[c] = 0.0
+
     for c in binary_cols:
         if c not in df.columns:
             df[c] = 0
+
     for c in categorical_cols:
         if c not in df.columns:
             df[c] = "Unknown"
 
     df = df[EXPECTED_COLS]
 
-    # ------------------ Preprocessing ------------------
+    # --------------------------------------------------------
+    # PREPROCESSING
+    # --------------------------------------------------------
     pre = build_preprocessor(
         continuous_cols=continuous_cols,
         binary_cols=binary_cols,
@@ -123,14 +122,18 @@ if uploaded_file is not None:
     X = pd.DataFrame(X, columns=pre.get_feature_names_out())
     X = X.reindex(columns=feature_names, fill_value=0).values
 
-    # ------------------ Latent / pseudotime / cluster ------------------
+    # --------------------------------------------------------
+    # LATENT / PSEUDOTIME / CLUSTER
+    # --------------------------------------------------------
     latents = compute_latent(model, X)
     pseudotime = compute_pseudotime(latents)
 
     cluster_ids = assign_cluster(kmeans, latents)
     phenotypes = [CLUSTER_NAMES.get(c, f"Cluster {c}") for c in cluster_ids]
 
-    # ------------------ Reconstruction error ------------------
+    # --------------------------------------------------------
+    # RECONSTRUCTION ERROR & OOD FLAG
+    # --------------------------------------------------------
     X_t = torch.tensor(X, dtype=torch.float32)
     with torch.no_grad():
         rec, _, _ = model(X_t)
@@ -138,13 +141,17 @@ if uploaded_file is not None:
     rec_error = ((rec.numpy() - X) ** 2).mean(axis=1)
     ood_flag = rec_error > np.percentile(rec_error, 95)
 
-    # ------------------ Results table ------------------
+    # Convert OOD flag to icons
+    ood_icon = ["❌" if flag else "✅" for flag in ood_flag]
+
+    # --------------------------------------------------------
+    # RESULTS TABLE
+    # --------------------------------------------------------
     results = pd.DataFrame({
-        "pseudotime": np.round(pseudotime, 4),
-        "cluster_id": cluster_ids,
-        "phenotype": phenotypes,
-        "OOD_flag": ood_flag,
-        "reconstruction_error": np.round(rec_error, 4)
+        "Pseudotime": np.round(pseudotime, 4),
+        "Phenotype": phenotypes,
+        "OOD": ood_icon,
+        "Reconstruction Error": np.round(rec_error, 4)
     })
 
     st.subheader("Patient‑Level Results")
@@ -157,7 +164,9 @@ if uploaded_file is not None:
         mime="text/csv"
     )
 
-    # ------------------ Latent plot ------------------
+    # --------------------------------------------------------
+    # LATENT SPACE PLOT
+    # --------------------------------------------------------
     st.subheader("Latent Space & Pseudotime")
 
     fig, ax = plt.subplots(figsize=(6, 5))
@@ -172,6 +181,77 @@ if uploaded_file is not None:
     ax.set_ylabel("Latent Dimension 2 (z2)")
     plt.colorbar(sc, ax=ax, label="Pseudotime")
     st.pyplot(fig)
+
+# ============================================================
+# RESULTS SUMMARY BOX ✅
+# ============================================================
+if results is not None:
+
+    st.divider()
+    st.subheader("Results Summary")
+
+    total = len(results)
+    avg_pt = results["Pseudotime"].mean()
+    n_ood = sum(results["OOD"] == "❌")
+    unique_pheno = results["Phenotype"].nunique()
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    col1.metric("Total Patients", total)
+    col2.metric("Average Pseudotime", f"{avg_pt:.2f}")
+    col3.metric("Out‑of‑Distribution", f"{n_ood}")
+    col4.metric("Phenotypes Detected", unique_pheno)
+
+# ============================================================
+# SYNTHETIC DATA GENERATION (ALWAYS VISIBLE)
+# ============================================================
+st.divider()
+st.header("Synthetic Patient Generation")
+
+num_samples = st.slider(
+    "Number of synthetic patients",
+    min_value=10,
+    max_value=200,
+    value=50
+)
+
+if st.button("Generate Synthetic Patients"):
+
+    latent_dim = 32  # fixed from training
+    z = torch.randn(num_samples, latent_dim)
+
+    with torch.no_grad():
+        synthetic = model.decode(z).numpy()
+
+    syn = pd.DataFrame(synthetic, columns=feature_names)
+
+    decoded = pd.DataFrame()
+    decoded["age_census"] = (syn["cont__age_census"] * 100).round().astype(int)
+
+    bin_cols_syn = [c for c in syn.columns if c.startswith("bin__")]
+    for col in bin_cols_syn:
+        decoded[col.replace("bin__", "")] = (syn[col] >= 0.5).astype(int)
+
+    region_cols = [c for c in syn.columns if c.startswith("cat__region")]
+    decoded["region"] = syn[region_cols].idxmax(axis=1).str.replace("cat__region_", "")
+
+    st.success(f"Generated {num_samples} synthetic patients")
+    st.dataframe(decoded.head(10), use_container_width=True)
+
+    st.download_button(
+        "Download Decoded Synthetic Dataset",
+        decoded.to_csv(index=False),
+        file_name="synthetic_tb_patients.csv",
+        mime="text/csv"
+    )
+
+st.caption(
+    "Synthetic data are generated in model feature space and decoded for "
+    "approximate clinical interpretability only. This system does not replace "
+    "medical diagnosis."
+)
+
+
 
 # ============================================================
 # SYNTHETIC DATA GENERATION (ALWAYS VISIBLE ✅)
