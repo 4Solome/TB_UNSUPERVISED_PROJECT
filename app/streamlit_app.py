@@ -234,66 +234,88 @@ st.header("Synthetic Patient Generation")
 
 
 # ============================================================
-# SYNTHETIC DATA GENERATION (DECODED)
+# SYNTHETIC DATA GENERATION (DECODED, INTERPRETABLE)
 # ============================================================
 st.divider()
 st.header("Synthetic Patient Generation")
 
-num_samples = st.slider("Number of synthetic patients", 10, 100, 50)
+num_samples = st.slider("Number of synthetic patients", 10, 200, 50)
 
 if st.button("Generate Synthetic Patients"):
 
-    model, feature_names = load_ttvae()
-    device = next(model.parameters()).device
+    # ✅ Reuse already-loaded model & feature_names
+    latent_dim = 32  # fixed from training
 
-    example_z = compute_latent(model, np.zeros((1, len(feature_names))))
-    latent_dim = example_z.shape[1]
-
-    z = torch.randn(num_samples, latent_dim).to(device)
+    z = torch.randn(num_samples, latent_dim)
 
     with torch.no_grad():
         synthetic = model.decode(z).cpu().numpy()
 
     syn = pd.DataFrame(synthetic, columns=feature_names)
 
-    # ===========================
-    # ✅ DECODE SYNTHETIC DATA
-    # ===========================
-
+    # ========================================================
+    # DECODE SYNTHETIC DATA INTO CLINICAL SPACE
+    # ========================================================
     decoded = pd.DataFrame()
 
-    # ---- Age (inverse scaling: assume 0–100)
-    decoded["age_census"] = (syn["cont__age_census"] * 100).round().astype(int)
+    # ---- Continuous features (reasonable inverse scaling)
+    def safe(col, scale, offset=0):
+        return ((syn[col].clip(0, 1) * scale) + offset).round().astype(int)
 
-    # ---- Binary variables
+    if "cont__age_census" in syn:
+        decoded["age_census"] = safe("cont__age_census", 100)
+
+    if "cont__cough_d" in syn:
+        decoded["cough_d"] = safe("cont__cough_d", 30)
+
+    if "cont__fever_d" in syn:
+        decoded["fever_d"] = safe("cont__fever_d", 30)
+
+    if "cont__wloss_d" in syn:
+        decoded["wloss_d"] = safe("cont__wloss_d", 365)
+
+    if "cont__sputum_d" in syn:
+        decoded["sputum_d"] = safe("cont__sputum_d", 30)
+
+    if "cont__tbtreat_w" in syn:
+        decoded["tbtreat_w"] = safe("cont__tbtreat_w", 52)
+
+    if "cont__tbhist_y" in syn:
+        decoded["tbhist_y"] = safe("cont__tbhist_y", 35, offset=1990)
+
+    # ---- Binary features
     bin_cols = [c for c in syn.columns if c.startswith("bin__")]
     for col in bin_cols:
         decoded[col.replace("bin__", "")] = (syn[col] >= 0.5).astype(int)
 
-    # ---- Region (one-hot)
-    region_cols = [c for c in syn.columns if c.startswith("cat__region")]
-    decoded["region"] = (
-        syn[region_cols].idxmax(axis=1).str.replace("cat__region_", "")
+    # ---- Categorical features (one-hot collapse)
+    cat_prefixes = sorted(
+        set("_".join(c.split("_")[:2]) for c in syn.columns if c.startswith("cat__"))
     )
 
+    for prefix in cat_prefixes:
+        cat_cols = [c for c in syn.columns if c.startswith(prefix)]
+        decoded[prefix.replace("cat__", "")] = (
+            syn[cat_cols].idxmax(axis=1)
+                .str.replace(prefix + "_", "")
+        )
+
+    # ========================================================
+    # DISPLAY & DOWNLOAD
+    # ========================================================
     st.success(f"Generated {num_samples} decoded synthetic patients")
 
-    st.dataframe(decoded.head(10))
+    st.dataframe(decoded.head(10), use_container_width=True)
 
     st.download_button(
         "Download Decoded Synthetic Dataset",
         decoded.to_csv(index=False),
-        file_name="synthetic_tb_patients_decoded.csv"
+        file_name="synthetic_tb_patients_decoded.csv",
+        mime="text/csv"
     )
 
-st.divider()
 st.caption(
-    "Synthetic data are generated in model feature space and decoded for clinical "
-    "interpretability. This system does not replace medical diagnosis."
-)
-
-
-st.caption(
-    "This system supports tuberculosis risk profiling for research purposes "
-    "and does not replace medical diagnosis."
+    "Synthetic data are generated from the learned latent space and decoded into "
+    "approximate clinical feature values for qualitative validation and model "
+    "auditing only. This system does not replace medical diagnosis."
 )
