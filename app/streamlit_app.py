@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
+import json
 
 from utils import (
     build_preprocessor,
@@ -15,32 +16,39 @@ from utils import (
 )
 
 # ============================================================
-# PAGE CONFIG
+# PAGE CONFIG & TITLE
 # ============================================================
-st.set_page_config(
-    page_title="TTVAE Tuberculosis Risk Sequencer",
-    layout="centered"
-)
+st.set_page_config(page_title="TB Risk Profiling System (TTVAE‑Based)", layout="wide")
 
-st.title("TTVAE Tuberculosis Risk Sequencer")
+st.title("TB Risk Profiling System (TTVAE‑Based)")
 st.caption(
-    "Upload a TB patient CSV to obtain pseudotime risk scores, "
-    "phenotype assignments, and reliability indicators."
+    "A cohort‑based system for latent tuberculosis risk sequencing and "
+    "phenotype discovery using a Transformer‑based Tabular Variational Autoencoder."
 )
 
 # ============================================================
-# PHENOTYPE LABELS
+# LOAD MODELS & FIXED ARTIFACTS
 # ============================================================
-CLUSTER_NAMES = {
-    0: "Low‑Symptom TB Risk",
-    1: "Active Symptomatic TB",
-    2: "Minimal‑Information Profile",
-    3: "Transitional TB Risk",
-    4: "Laboratory‑Confirmed TB"
+feature_names = load_feature_names()
+model = load_ttvae(input_dim=len(feature_names))
+kmeans = load_cluster_model()
+
+with open("models/ood_threshold.json", "r") as f:
+    OOD_THRESHOLD = json.load(f)["ood_threshold"]
+
+# ============================================================
+# PHENOTYPE DEFINITIONS
+# ============================================================
+PHENOTYPE_INFO = {
+    0: ("Low‑Symptom TB Risk", "Low symptom burden with minimal laboratory evidence."),
+    1: ("Active Symptomatic TB", "High clinical symptom burden consistent with active TB."),
+    2: ("Minimal‑Information Profile", "Sparse diagnostic information and weak signals."),
+    3: ("Transitional TB Risk", "Mixed clinical and laboratory signals."),
+    4: ("Laboratory‑Confirmed TB", "Strong bacteriological and laboratory evidence.")
 }
 
 # ============================================================
-# TRAINING FEATURE GROUPS
+# FEATURE GROUPS (TRAINING‑CONSISTENT)
 # ============================================================
 continuous_cols = [
     "age_census", "cough_d", "fever_d", "wloss_d",
@@ -49,10 +57,9 @@ continuous_cols = [
 
 binary_cols = [
     "sex_census", "setting", "smoke_now", "smoke_past", "hiv_res",
-    "cough", "fever", "weight_loss", "night_sweats",
-    "chest_pain", "blood_sputum", "sputum", "hist_rx",
-    "current_rx", "xray_normal", "smear_pos",
-    "culture", "cult_pos", "bact"
+    "cough", "fever", "weight_loss", "night_sweats", "chest_pain",
+    "blood_sputum", "sputum", "hist_rx", "current_rx",
+    "xray_normal", "smear_pos", "culture", "cult_pos", "bact"
 ]
 
 categorical_cols = [
@@ -61,280 +68,211 @@ categorical_cols = [
     "zn", "genexpert", "final_result"
 ]
 
-EXPECTED_COLS = continuous_cols + binary_cols + categorical_cols
+ALL_COLS = continuous_cols + binary_cols + categorical_cols
 
 # ============================================================
-# LOAD MODELS
+# SECTION 1 — UPLOAD
 # ============================================================
-feature_names = load_feature_names()
-model = load_ttvae(input_dim=len(feature_names))
-kmeans = load_cluster_model()
+st.header("1. Upload Patient Cohort")
+
+uploaded_file = st.file_uploader(
+    "Upload a CSV file containing TB patient data",
+    type=["csv"]
+)
+
+analyze = st.button("Analyze Cohort")
+
+if not uploaded_file or not analyze:
+    st.info("Upload a CSV file and click **Analyze Cohort** to begin.")
+    st.stop()
+
+df_raw = pd.read_csv(uploaded_file)
 
 # ============================================================
-# CSV UPLOAD (OPTIONAL)
+# PREPROCESSING (ROBUST TO MISSING FEATURES)
 # ============================================================
-st.header("Cohort Analysis (CSV Upload)")
-uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
+df = df_raw.copy()
 
-results = None  # Will hold final results if CSV is provided
+for c in continuous_cols:
+    if c not in df.columns:
+        df[c] = 0.0
+for c in binary_cols:
+    if c not in df.columns:
+        df[c] = 0
+for c in categorical_cols:
+    if c not in df.columns:
+        df[c] = "Unknown"
+
+df = df[ALL_COLS]
+
+pre = build_preprocessor(continuous_cols, binary_cols, categorical_cols)
+dummy = {c: 0 for c in continuous_cols + binary_cols}
+dummy.update({c: "Unknown" for c in categorical_cols})
+pre.fit(pd.DataFrame([dummy]))
+
+X = pre.transform(df)
+X = pd.DataFrame(X, columns=pre.get_feature_names_out())
+X = X.reindex(columns=feature_names, fill_value=0).values
 
 # ============================================================
-# COHORT ANALYSIS
+# LATENT INFERENCE
 # ============================================================
-if uploaded_file is not None:
+latents = compute_latent(model, X)
+pseudotime = compute_pseudotime(latents)
+clusters = assign_cluster(kmeans, latents)
 
-    df = pd.read_csv(uploaded_file)
+# ============================================================
+# RISK CATEGORY (CLEAR LOGIC)
+# ============================================================
+def risk_bucket(pt):
+    if pt < 0.3:
+        return "Low Risk"
+    if pt < 0.7:
+        return "Moderate Risk"
+    return "High Risk"
 
-    st.subheader("Uploaded Data Preview")
-    st.dataframe(df.head(), use_container_width=True)
+risk_category = [risk_bucket(p) for p in pseudotime]
 
-    # --------------------------------------------------------
-    # SILENTLY HANDLE MISSING COLUMNS
-    # --------------------------------------------------------
-    for c in continuous_cols:
-        if c not in df.columns:
-            df[c] = 0.0
+# ============================================================
+# RECONSTRUCTION ERROR & FIXED OOD LOGIC
+# ============================================================
+Xt = torch.tensor(X, dtype=torch.float32)
+with torch.no_grad():
+    rec, _, _ = model(Xt)
 
-    for c in binary_cols:
-        if c not in df.columns:
-            df[c] = 0
+rec_error = ((rec.numpy() - X) ** 2).mean(axis=1)
+ood_flag = rec_error > OOD_THRESHOLD
 
-    for c in categorical_cols:
-        if c not in df.columns:
-            df[c] = "Unknown"
+reliability = ["⚠️ OOD Warning" if f else "✅ In Distribution" for f in ood_flag]
 
-    df = df[EXPECTED_COLS]
+# ============================================================
+# PATIENT‑LEVEL RESULTS TABLE
+# ============================================================
+phenotype_names = [PHENOTYPE_INFO[c][0] for c in clusters]
 
-    # --------------------------------------------------------
-    # PREPROCESSING
-    # --------------------------------------------------------
-    pre = build_preprocessor(
-        continuous_cols=continuous_cols,
-        binary_cols=binary_cols,
-        categorical_cols=categorical_cols
-    )
+results = pd.DataFrame({
+    "Pseudotime": np.round(pseudotime, 3),
+    "Risk Category": risk_category,
+    "Phenotype": phenotype_names,
+    "Reliability": reliability,
+    "Reconstruction Error": np.round(rec_error, 3)
+})
 
-    dummy = {c: 0 for c in continuous_cols + binary_cols}
-    dummy.update({c: "Unknown" for c in categorical_cols})
-    pre.fit(pd.DataFrame([dummy]))
+# ============================================================
+# SECTION 2 — MAIN COHORT SUMMARY
+# ============================================================
+st.header("2. Cohort Summary")
 
-    X = pre.transform(df)
-    X = pd.DataFrame(X, columns=pre.get_feature_names_out())
-    X = X.reindex(columns=feature_names, fill_value=0).values
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Total Patients", len(results))
+c2.metric("Average Pseudotime", f"{results['Pseudotime'].mean():.2f}")
+c3.metric("OOD Warnings", int(ood_flag.sum()))
+c4.metric("Phenotypes Detected", results["Phenotype"].nunique())
 
-    # --------------------------------------------------------
-    # LATENT / PSEUDOTIME / CLUSTER
-    # --------------------------------------------------------
-    latents = compute_latent(model, X)
-    pseudotime = compute_pseudotime(latents)
+# ============================================================
+# SECTION 3 — MAIN RESULTS TABLE
+# ============================================================
+st.header("3. Patient‑Level Results")
+st.dataframe(results, use_container_width=True)
 
-    cluster_ids = assign_cluster(kmeans, latents)
-    phenotypes = [CLUSTER_NAMES.get(c, f"Cluster {c}") for c in cluster_ids]
+st.download_button(
+    "Download Results CSV",
+    results.to_csv(index=False),
+    file_name="tb_risk_results.csv",
+    mime="text/csv"
+)
 
-    # --------------------------------------------------------
-    # RECONSTRUCTION ERROR & OOD FLAG
-    # --------------------------------------------------------
-    X_t = torch.tensor(X, dtype=torch.float32)
-    with torch.no_grad():
-        rec, _, _ = model(X_t)
+# ============================================================
+# SECTION 4 — MAIN PLOTS
+# ============================================================
+st.header("4. Visual Interpretation")
 
-    rec_error = ((rec.numpy() - X) ** 2).mean(axis=1)
-    ood_flag = rec_error > np.percentile(rec_error, 95)
+colA, colB = st.columns(2)
 
-    # ✅ Display rule:
-    # ✅  -> OOD detected
-    # ⬜ -> In-distribution
-    ood_display = ["✅" if flag else "⬜" for flag in ood_flag]
+with colA:
+    st.subheader("Latent Space Colored by Phenotype")
+    fig, ax = plt.subplots()
+    for cid, (name, _) in PHENOTYPE_INFO.items():
+        mask = clusters == cid
+        ax.scatter(latents[mask,0], latents[mask,1], label=name, alpha=0.6)
+    ax.set_xlabel("z1")
+    ax.set_ylabel("z2")
+    ax.legend(fontsize=8)
+    st.pyplot(fig)
 
-    # --------------------------------------------------------
-    # RESULTS TABLE
-    # --------------------------------------------------------
-    results = pd.DataFrame({
-        "Pseudotime": np.round(pseudotime, 4),
-        "Phenotype": phenotypes,
-        "OOD": ood_display,
-        "Reconstruction Error": np.round(rec_error, 4)
-    })
-
-    st.subheader("Patient‑Level Results")
-    st.dataframe(results, use_container_width=True)
-
-    st.download_button(
-        "Download Results CSV",
-        results.to_csv(index=False),
-        file_name="ttvae_patient_results.csv",
-        mime="text/csv"
-    )
-
-    # --------------------------------------------------------
-    # LATENT SPACE PLOT
-    # --------------------------------------------------------
-    st.subheader("Latent Space & Pseudotime")
-
-    fig, ax = plt.subplots(figsize=(6, 5))
-    sc = ax.scatter(
-        latents[:, 0],
-        latents[:, 1],
-        c=pseudotime,
-        cmap="plasma",
-        s=40
-    )
-    ax.set_xlabel("Latent Dimension 1 (z1)")
-    ax.set_ylabel("Latent Dimension 2 (z2)")
+with colB:
+    st.subheader("Latent Space Pseudotime Gradient")
+    fig, ax = plt.subplots()
+    sc = ax.scatter(latents[:,0], latents[:,1], c=pseudotime, cmap="plasma")
+    ax.set_xlabel("z1")
+    ax.set_ylabel("z2")
     plt.colorbar(sc, ax=ax, label="Pseudotime")
     st.pyplot(fig)
 
-# ============================================================
-# RESULTS SUMMARY BOX
-# ============================================================
-if results is not None:
+st.subheader("Phenotype Distribution in Uploaded Cohort")
+fig, ax = plt.subplots()
+results["Phenotype"].value_counts().plot(kind="bar", ax=ax)
+ax.set_ylabel("Patient Count")
+st.pyplot(fig)
 
-    st.divider()
-    st.subheader("Results Summary")
-
-    total = len(results)
-    avg_pt = results["Pseudotime"].mean()
-    n_ood = sum(results["OOD"] == "✅")
-    unique_pheno = results["Phenotype"].nunique()
-
-    col1, col2, col3, col4 = st.columns(4)
-
-    col1.metric("Total Patients", total)
-    col2.metric("Average Pseudotime", f"{avg_pt:.2f}")
-    col3.metric("OOD Detected", n_ood)
-    col4.metric("Phenotypes Detected", unique_pheno)
-
-    st.caption("✅ = Out‑of‑Distribution detected  ⬜ = In‑distribution")
-
-
+st.subheader("Pseudotime Distribution Across Uploaded Cohort")
+fig, ax = plt.subplots()
+ax.hist(results["Pseudotime"], bins=20)
+ax.set_xlabel("Pseudotime")
+ax.set_ylabel("Count")
+st.pyplot(fig)
 
 # ============================================================
-# CLUSTER‑LEVEL SUMMARY
+# SECTION 5 — DETAILED INTERPRETATION
 # ============================================================
-st.divider()
-st.subheader("Cluster‑Level Summary")
+st.header("5. Detailed Interpretation")
 
-cluster_summary = (
-    results
-    .assign(Cluster=cluster_ids)
-    .groupby("Cluster")
-    .agg(
+with st.expander("Cluster‑Level Summary"):
+    summary = results.groupby("Phenotype").agg(
         Count=("Pseudotime", "count"),
         Mean_Pseudotime=("Pseudotime", "mean"),
         Mean_Reconstruction_Error=("Reconstruction Error", "mean")
+    ).reset_index()
+    st.dataframe(summary)
+
+with st.expander("Cluster Feature Profiles"):
+    prof = df.copy()
+    prof["Cluster"] = clusters
+    profile_means = prof.groupby("Cluster").mean(numeric_only=True).reset_index()
+    profile_means["Phenotype"] = profile_means["Cluster"].map(
+        lambda x: PHENOTYPE_INFO[x][0]
     )
-    .reset_index()
-)
+    st.dataframe(profile_means)
+    st.download_button(
+        "Download Cluster Feature Profiles CSV",
+        profile_means.to_csv(index=False),
+        file_name="cluster_feature_profiles.csv"
+    )
 
-# Map cluster names for readability
-cluster_summary["Phenotype"] = cluster_summary["Cluster"].map(CLUSTER_NAMES)
-
-# Reorder columns for clarity
-cluster_summary = cluster_summary[
-    ["Cluster", "Phenotype", "Count", "Mean_Pseudotime", "Mean_Reconstruction_Error"]
-]
-
-st.dataframe(
-    cluster_summary.style.format({
-        "Mean_Pseudotime": "{:.3f}",
-        "Mean_Reconstruction_Error": "{:.3f}"
-    }),
-    use_container_width=True
-)
-
-st.download_button(
-    "Download Cluster‑Level Summary CSV",
-    cluster_summary.to_csv(index=False),
-    file_name="cluster_level_summary.csv",
-    mime="text/csv"
-)
+with st.expander("View Uploaded Data Preview"):
+    st.dataframe(df_raw.head(200))
 
 # ============================================================
-# CLUSTER FEATURE PROFILES
+# SECTION 6 — SYNTHETIC DATA GENERATION
 # ============================================================
-st.subheader("Cluster Feature Profiles")
+st.header("6. Synthetic Patient Generation")
 
-# Attach cluster IDs back to the original (decoded) feature table
-profile_df = df.copy()
-profile_df["Cluster"] = cluster_ids
-
-# Compute mean feature values per cluster
-cluster_profiles = (
-    profile_df
-    .groupby("Cluster")
-    .mean(numeric_only=True)
-    .reset_index()
-)
-
-# Add phenotype names
-cluster_profiles["Phenotype"] = cluster_profiles["Cluster"].map(CLUSTER_NAMES)
-
-# Move Phenotype column next to Cluster
-cols = ["Cluster", "Phenotype"] + [
-    c for c in cluster_profiles.columns if c not in ["Cluster", "Phenotype"]
-]
-cluster_profiles = cluster_profiles[cols]
-
-st.dataframe(cluster_profiles, use_container_width=True)
-
-st.download_button(
-    "Download Cluster Feature Profiles CSV",
-    cluster_profiles.to_csv(index=False),
-    file_name="cluster_feature_profiles.csv",
-    mime="text/csv"
-)
-
-
-
-
-
-# ============================================================
-# SYNTHETIC DATA GENERATION (ALWAYS VISIBLE)
-# ============================================================
-st.divider()
-st.header("Synthetic Patient Generation")
-
-num_samples = st.slider(
-    "Number of synthetic patients",
-    min_value=10,
-    max_value=200,
-    value=50
-)
+num_samples = st.slider("Number of synthetic patients", 10, 200, 50)
 
 if st.button("Generate Synthetic Patients"):
-
-    latent_dim = 32  # fixed from training
-    z = torch.randn(num_samples, latent_dim)
-
+    z = torch.randn(num_samples, 32)
     with torch.no_grad():
-        synthetic = model.decode(z).numpy()
+        synth = model.decode(z).numpy()
 
-    syn = pd.DataFrame(synthetic, columns=feature_names)
-
-    decoded = pd.DataFrame()
-    decoded["age_census"] = (syn["cont__age_census"] * 100).round().astype(int)
-
-    bin_cols_syn = [c for c in syn.columns if c.startswith("bin__")]
-    for col in bin_cols_syn:
-        decoded[col.replace("bin__", "")] = (syn[col] >= 0.5).astype(int)
-
-    region_cols = [c for c in syn.columns if c.startswith("cat__region")]
-    decoded["region"] = syn[region_cols].idxmax(axis=1).str.replace(
-        "cat__region_", ""
-    )
-
-    st.success(f"Generated {num_samples} synthetic patients")
-    st.dataframe(decoded.head(10), use_container_width=True)
-
+    synth_df = pd.DataFrame(synth, columns=feature_names)
+    st.dataframe(synth_df.head())
     st.download_button(
-        "Download Decoded Synthetic Dataset",
-        decoded.to_csv(index=False),
-        file_name="synthetic_tb_patients.csv",
-        mime="text/csv"
+        "Download Synthetic Dataset",
+        synth_df.to_csv(index=False),
+        file_name="synthetic_patients.csv"
     )
 
 st.caption(
-    "Synthetic data are generated in model feature space and decoded for "
-    "approximate clinical interpretability only. "
-    "This system does not replace medical diagnosis."
+    "This system supports clinical research and risk stratification and does not "
+    "replace medical diagnosis."
 )
