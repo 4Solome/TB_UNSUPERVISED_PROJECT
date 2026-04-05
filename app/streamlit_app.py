@@ -1,8 +1,8 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
+import torch
+import json
 
 from utils import (
     build_preprocessor,
@@ -12,527 +12,304 @@ from utils import (
     compute_latent,
     compute_pseudotime,
     check_ood,
-    assign_cluster,
-    decode_latent
+    assign_cluster
 )
 
 # ============================================================
 # PAGE CONFIG
 # ============================================================
-st.set_page_config(
-    page_title="TB Risk Profiling System",
-    layout="centered"
-)
+st.set_page_config(page_title="TB Risk Profiling System", layout="centered")
 
-# ============================================================
-# LOAD ARTIFACTS
-# ============================================================
-@st.cache_resource
-def load_artifacts():
-    model, feature_names = load_ttvae()
-    kmeans = load_cluster_model()
-    threshold = load_ood_threshold()
-    return model, feature_names, kmeans, threshold
-
-model, feature_names, kmeans, ood_threshold = load_artifacts()
-
-# ============================================================
-# APP TEXT
-# ============================================================
-st.title("TB Risk Profiling System (TTVAE-Based)")
+st.title("TB Risk Profiling System (TTVAE‑Based)")
 st.caption(
-    "Latent tuberculosis phenotype discovery, pseudotime-based risk sequencing, "
-    "and synthetic profile generation using a Transformer-based Tabular Variational Autoencoder."
+    "Latent tuberculosis phenotype discovery and risk sequencing "
+    "using a Transformer‑based Tabular Variational Autoencoder."
 )
 
 # ============================================================
-# PHENOTYPE LABELS
+# CLUSTER LABELS
 # ============================================================
 cluster_info = {
-    0: {
-        "name": "Low-Symptom TB Risk",
-        "description": "Individuals with relatively low symptom burden but still located within the learned tuberculosis risk space."
-    },
-    1: {
-        "name": "Active Symptomatic TB",
-        "description": "Patients with stronger clinical symptoms and patterns consistent with active symptomatic tuberculosis."
-    },
-    2: {
-        "name": "Minimal-Information Profile",
-        "description": "Cases with sparse or limited diagnostic information and weak overall feature activation."
-    },
-    3: {
-        "name": "Transitional TB Risk",
-        "description": "Individuals showing mixed clinical and laboratory signals between lower-risk and confirmed profiles."
-    },
-    4: {
-        "name": "Laboratory-Confirmed TB",
-        "description": "Patients with stronger bacteriological and laboratory evidence consistent with confirmed tuberculosis."
-    }
+    0: ("Low‑Symptom TB Risk",
+        "Low symptom burden but within the learned TB‑risk space."),
+    1: ("Active Symptomatic TB",
+        "High clinical symptom burden consistent with active TB."),
+    2: ("Minimal‑Information Profile",
+        "Sparse diagnostic information and weak signals."),
+    3: ("Transitional TB Risk",
+        "Mixed clinical features between early and confirmed TB profiles."),
+    4: ("Laboratory‑Confirmed TB",
+        "Strong bacteriological and laboratory evidence.")
 }
 
 # ============================================================
 # TRAINING FEATURE GROUPS
 # ============================================================
-continuous_cols = [
-    "age_census", "cough_d", "fever_d", "wloss_d",
-    "sputum_d", "tbhist_y", "tbtreat_w"
-]
-
+continuous_cols = ["age_census", "cough_d", "fever_d", "wloss_d", "sputum_d"]
 binary_cols = [
-    "sex_census", "setting", "smoke_now", "smoke_past", "hiv_res",
-    "cough", "fever", "weight_loss", "night_sweats", "chest_pain",
-    "blood_sputum", "sputum", "hist_rx", "current_rx",
+    "sex_census", "cough", "fever", "weight_loss", "night_sweats",
+    "chest_pain", "blood_sputum", "sputum",
+    "smoke_now", "smoke_past", "hiv_res", "hist_rx",
     "xray_normal", "smear_pos", "culture", "cult_pos", "bact"
 ]
-
-categorical_cols = [
-    "region", "married", "edu", "occupation",
-    "xrayres", "central_cxr_res", "zn", "genexpert", "final_result"
-]
-
-all_expected_cols = continuous_cols + binary_cols + categorical_cols
+categorical_cols = ["region", "married", "edu", "occupation"]
 
 # ============================================================
-# HELPERS
+# LOAD MODELS ONCE
 # ============================================================
-def risk_label(score: float) -> str:
-    if score < 0.3:
-        return "Low Risk"
-    elif score < 0.7:
-        return "Moderate Risk"
-    return "High Risk"
+@st.cache_resource
+def load_models():
+    model, feature_names = load_ttvae()
+    kmeans = load_cluster_model()
+    threshold = load_ood_threshold()
+    return model, kmeans, threshold, feature_names
 
-def render_risk_bar(score: float):
-    st.progress(float(score))
-    if score < 0.3:
-        st.caption("Low ----|---- Moderate ----|---- High\n↑ Patient")
-    elif score < 0.7:
-        st.caption("Low ----|---- Moderate ----|---- High\n           ↑ Patient")
-    else:
-        st.caption("Low ----|---- Moderate ----|---- High\n                        ↑ Patient")
-
-def parse_categories_from_feature_names(feature_names, categorical_cols):
-    categories = {}
-    for col in categorical_cols:
-        vals = []
-        prefixes = [f"cat__{col}_", f"categorical__{col}_"]
-        for f in feature_names:
-            for p in prefixes:
-                if f.startswith(p):
-                    vals.append(f.replace(p, ""))
-        categories[col] = sorted(list(set(vals))) if vals else ["Unknown"]
-    return categories
-
-category_options = parse_categories_from_feature_names(feature_names, categorical_cols)
-
-def build_reference_frame():
-    anchor_ranges = {
-        "age_census": [0, 100],
-        "cough_d": [0, 365],
-        "fever_d": [0, 365],
-        "wloss_d": [0, 2000],
-        "sputum_d": [0, 365],
-        "tbhist_y": [1900, 2025],
-        "tbtreat_w": [0, 365]
-    }
-
-    max_len = max(
-        2,
-        max((len(category_options.get(c, ["Unknown"])) for c in categorical_cols), default=2)
-    )
-
-    rows = []
-    for i in range(max_len):
-        row = {}
-        for c in continuous_cols:
-            vals = anchor_ranges.get(c, [0, 1])
-            row[c] = vals[i % len(vals)]
-        for c in binary_cols:
-            row[c] = i % 2
-        for c in categorical_cols:
-            opts = category_options.get(c, ["Unknown"])
-            row[c] = opts[i % len(opts)] if opts else "Unknown"
-        rows.append(row)
-
-    return pd.DataFrame(rows)
-
-reference_fit_df = build_reference_frame()
-
-def prepare_dataframe(df):
-    df = df.copy()
-
-    for c in all_expected_cols:
-        if c not in df.columns:
-            if c in continuous_cols:
-                df[c] = 0.0
-            elif c in binary_cols:
-                df[c] = 0
-            else:
-                default_cat = category_options.get(c, ["Unknown"])[0]
-                df[c] = default_cat
-
-    df = df[all_expected_cols].copy()
-
-    for c in continuous_cols:
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-
-    for c in binary_cols:
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).clip(0, 1)
-
-    for c in categorical_cols:
-        df[c] = df[c].astype(str)
-
-    return df
-
-def transform_with_runtime_reference(df_raw):
-    df_raw = prepare_dataframe(df_raw)
-
-    pre = build_preprocessor(
-        continuous_cols=continuous_cols,
-        binary_cols=binary_cols,
-        categorical_cols=categorical_cols
-    )
-
-    fit_df = pd.concat([reference_fit_df, df_raw], ignore_index=True)
-    pre.fit(fit_df)
-
-    X = pre.transform(df_raw)
-    X = pd.DataFrame(X, columns=pre.get_feature_names_out())
-    X = X.reindex(columns=feature_names, fill_value=0.0)
-
-    return X.values
-
-def single_patient_pseudotime(latents, kmeans_model):
-    z1 = float(latents[0, 0])
-    centroid_z1 = kmeans_model.cluster_centers_[:, 0]
-    score = (z1 - centroid_z1.min()) / (centroid_z1.max() - centroid_z1.min() + 1e-10)
-    return float(np.clip(score, 0.0, 1.0))
+model, kmeans, threshold, feature_names = load_models()
 
 # ============================================================
-# TABS
+# INPUT MODE SELECTION
 # ============================================================
-tab1, tab2, tab3 = st.tabs([
-    "Analyze Single Patient",
-    "Analyze Cohort (CSV Upload)",
-    "Generate Synthetic Data"
-])
+st.header("Input Mode")
+mode = st.radio(
+    "Select analysis mode:",
+    ["Single Patient", "Cohort (CSV Upload)"]
+)
 
 # ============================================================
-# TAB 1: SINGLE PATIENT
+# MODE 1 — SINGLE PATIENT
 # ============================================================
-with tab1:
-    st.subheader("Single Patient Entry")
+if mode == "Single Patient":
 
-    col1, col2 = st.columns(2)
-    with col1:
-        age = st.slider("Age", 0, 100, 35)
-        sex = st.selectbox("Sex (0/1 style)", [0, 1], format_func=lambda x: "Female" if x == 0 else "Male")
-        setting = st.selectbox("Setting", [0, 1], help="Use dataset-compatible coding")
-        hiv_res = st.selectbox("HIV status", [0, 1], format_func=lambda x: "Negative / Unknown" if x == 0 else "Positive")
-    with col2:
-        smoke_now = st.selectbox("Current smoking", [0, 1])
-        smoke_past = st.selectbox("Past smoking", [0, 1])
-        hist_rx = st.selectbox("Previous TB treatment", [0, 1])
-        current_rx = st.selectbox("Currently on treatment", [0, 1])
+    st.header("Single Patient Entry")
 
-    st.markdown("**Symptoms**")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        cough = st.selectbox("Cough", [0, 1])
-        cough_d = st.number_input("Cough duration (days)", 0, 365, 0)
-        fever = st.selectbox("Fever", [0, 1])
-        fever_d = st.number_input("Fever duration (days)", 0, 365, 0)
-    with c2:
-        weight_loss = st.selectbox("Weight loss", [0, 1])
-        wloss_d = st.number_input("Weight-loss duration (days)", 0, 2000, 0)
-        sputum = st.selectbox("Sputum", [0, 1])
-        sputum_d = st.number_input("Sputum duration (days)", 0, 365, 0)
-    with c3:
-        night_sweats = st.selectbox("Night sweats", [0, 1])
-        chest_pain = st.selectbox("Chest pain", [0, 1])
-        blood_sputum = st.selectbox("Blood in sputum", [0, 1])
+    # --- Demographics
+    age = st.slider("Age (years)", 0, 100, 35)
+    sex = st.selectbox("Sex", ["Male", "Female"])
+    region = st.selectbox("Region", ["Central", "East", "North", "West"])
+    married = st.selectbox("Marital status",
+                           ["Single", "Married", "Separated", "Divorced",
+                            "Widowed", "Don't know", "Unknown"])
+    education = st.selectbox("Education level",
+                             ["None", "Primary", "Senior 1–4", "Senior 5–6",
+                              "Tertiary", "Don't know", "Unknown"])
+    occupation = st.selectbox("Occupation",
+                              ["Business", "Civil servant", "Healthcare worker", "Student",
+                               "Unemployed", "Farmer", "House wife/husband",
+                               "Skilled labor", "Other"])
 
-    st.markdown("**Radiology and Laboratory**")
-    c4, c5, c6 = st.columns(3)
-    with c4:
-        xray_normal = st.selectbox("X-ray normal", [0, 1])
-        xrayres = st.selectbox("X-ray result code", category_options.get("xrayres", ["Unknown"]))
-        central_cxr_res = st.selectbox("Central CXR result code", category_options.get("central_cxr_res", ["Unknown"]))
-    with c5:
-        smear_pos = st.selectbox("Smear positive", [0, 1])
-        culture = st.selectbox("Culture positive", [0, 1])
-        cult_pos = culture
-    with c6:
-        bact = st.selectbox("Bacteriological confirmation", [0, 1])
-        zn = st.selectbox("ZN result", category_options.get("zn", ["Unknown"]))
-        genexpert = st.selectbox("GeneXpert result", category_options.get("genexpert", ["Unknown"]))
+    # --- Symptoms
+    st.subheader("Symptoms")
+    cough = st.checkbox("Cough")
+    cough_d = st.number_input("Cough duration (days)", 0, 365, 0) if cough else 0
 
-    st.markdown("**Sociodemographic Categories**")
-    c7, c8, c9 = st.columns(3)
-    with c7:
-        region = st.selectbox("Region", category_options.get("region", ["Unknown"]))
-        married = st.selectbox("Marital status code", category_options.get("married", ["Unknown"]))
-    with c8:
-        edu = st.selectbox("Education code", category_options.get("edu", ["Unknown"]))
-        occupation = st.selectbox("Occupation code", category_options.get("occupation", ["Unknown"]))
-    with c9:
-        final_result = st.selectbox("Final result code", category_options.get("final_result", ["Unknown"]))
-        tbhist_y = st.number_input("TB history year", 1900, 2025, 2000)
-        tbtreat_w = st.number_input("TB treatment weeks", 0, 365, 0)
+    fever = st.checkbox("Fever")
+    fever_d = st.number_input("Fever duration (days)", 0, 365, 0) if fever else 0
 
-    if st.button("Analyze Patient", type="primary"):
-        patient_df = pd.DataFrame([{
+    weight_loss = st.checkbox("Weight loss")
+    wloss_d = st.number_input("Weight‑loss duration (days)", 0, 2000, 0) if weight_loss else 0
+
+    sputum = st.checkbox("Sputum production")
+    sputum_d = st.number_input("Sputum duration (days)", 0, 365, 0) if sputum else 0
+
+    night_sweats = st.checkbox("Night sweats")
+    chest_pain = st.checkbox("Chest pain")
+    blood_sputum = st.checkbox("Blood‑stained sputum")
+
+    # --- Labs
+    st.subheader("Laboratory")
+    xray = st.selectbox("Chest X‑ray", ["Normal", "Abnormal"])
+    smear = st.selectbox("Smear microscopy", ["Negative", "Positive"])
+    culture = st.selectbox("Culture", ["Negative", "Positive"])
+    genexpert = st.selectbox("GeneXpert", ["Negative", "Positive"])
+
+    if st.button("Analyze Single Patient"):
+
+        input_df = pd.DataFrame([{
             "age_census": age,
             "cough_d": cough_d,
             "fever_d": fever_d,
             "wloss_d": wloss_d,
             "sputum_d": sputum_d,
-            "tbhist_y": tbhist_y,
-            "tbtreat_w": tbtreat_w,
-            "sex_census": sex,
-            "setting": setting,
-            "smoke_now": smoke_now,
-            "smoke_past": smoke_past,
-            "hiv_res": hiv_res,
-            "cough": cough,
-            "fever": fever,
-            "weight_loss": weight_loss,
-            "night_sweats": night_sweats,
-            "chest_pain": chest_pain,
-            "blood_sputum": blood_sputum,
-            "sputum": sputum,
-            "hist_rx": hist_rx,
-            "current_rx": current_rx,
-            "xray_normal": xray_normal,
-            "smear_pos": smear_pos,
-            "culture": culture,
-            "cult_pos": cult_pos,
-            "bact": bact,
-            "region": str(region),
-            "married": str(married),
-            "edu": str(edu),
-            "occupation": str(occupation),
-            "xrayres": str(xrayres),
-            "central_cxr_res": str(central_cxr_res),
-            "zn": str(zn),
-            "genexpert": str(genexpert),
-            "final_result": str(final_result)
+
+            "sex_census": 1 if sex == "Male" else 2,
+            "cough": int(cough),
+            "fever": int(fever),
+            "weight_loss": int(weight_loss),
+            "night_sweats": int(night_sweats),
+            "chest_pain": int(chest_pain),
+            "blood_sputum": int(blood_sputum),
+            "sputum": int(sputum),
+            "smoke_now": 0,
+            "smoke_past": 0,
+            "hiv_res": 0,
+            "hist_rx": 0,
+            "xray_normal": 1 if xray == "Normal" else 0,
+            "smear_pos": 1 if smear == "Positive" else 0,
+            "culture": 1 if culture == "Positive" else 0,
+            "cult_pos": 1 if culture == "Positive" else 0,
+            "bact": 1 if genexpert == "Positive" else 0,
+
+            "region": region,
+            "married": married,
+            "edu": education,
+            "occupation": occupation
         }])
 
-        X = transform_with_runtime_reference(patient_df)
+        pre = build_preprocessor(continuous_cols, binary_cols, categorical_cols)
+
+        dummy = {c: 0 for c in continuous_cols + binary_cols}
+        dummy.update({c: "Unknown" for c in categorical_cols})
+        pre.fit(pd.DataFrame([dummy]))
+
+        X = pre.transform(input_df)
+        X = pd.DataFrame(X, columns=pre.get_feature_names_out())
+        X = X.reindex(columns=feature_names, fill_value=0).values
+
         latents = compute_latent(model, X)
+        pseudotime = float(compute_pseudotime(latents)[0])
         cluster = int(assign_cluster(kmeans, latents)[0])
+        recon = float(np.squeeze(check_ood(model, X, threshold)[1]))
 
-        pseudotime = single_patient_pseudotime(latents, kmeans)
-        ood_flags, recon_errors = check_ood(model, X, ood_threshold)
-        ood_flag = bool(ood_flags[0])
-        recon_error = float(recon_errors[0])
+        st.subheader("Results")
+        st.write("⚠️ *Single-patient pseudotime is reference-based and may appear low.*")
+        st.metric("Pseudotime (reference-based)", f"{pseudotime:.2f}")
 
-        st.divider()
-        st.header("Results")
+        name, desc = cluster_info[cluster]
+        st.subheader("Phenotype")
+        st.write(f"**{name}**")
+        st.caption(desc)
 
-        st.metric("TB Risk Score (Pseudotime)", f"{pseudotime:.2f}")
-
-        risk_cat = risk_label(pseudotime)
-        if risk_cat == "Low Risk":
-            st.success("Risk Category: Low Risk")
-        elif risk_cat == "Moderate Risk":
-            st.warning("Risk Category: Moderate Risk")
-        else:
-            st.error("Risk Category: High Risk")
-
-        render_risk_bar(pseudotime)
-
-        st.subheader("Latent Phenotype")
-        st.write(f"**{cluster_info[cluster]['name']}**")
-        st.caption(cluster_info[cluster]["description"])
-
-        st.subheader("Reliability Assessment")
-        if ood_flag:
-            st.warning("⚠️ Input lies outside training distribution.")
-        else:
-            st.success("✅ Input lies within training distribution.")
-
-        st.subheader("Model Confidence")
-        st.write(f"Reconstruction Error: `{recon_error:.4f}`")
-
-        single_result = pd.DataFrame({
-            "TB_Risk_Score": [pseudotime],
-            "Risk_Category": [risk_cat],
-            "Cluster": [cluster],
-            "Phenotype": [cluster_info[cluster]["name"]],
-            "OOD_Flag": [ood_flag],
-            "Reconstruction_Error": [recon_error],
-            "z1": [latents[0, 0]],
-            "z2": [latents[0, 1]]
-        })
-
-        st.download_button(
-            "Download Patient Result CSV",
-            single_result.to_csv(index=False),
-            file_name="single_patient_tb_result.csv",
-            mime="text/csv"
-        )
+        st.write(f"Reconstruction Error: `{recon:.2f}`")
 
 # ============================================================
-# TAB 2: COHORT UPLOAD
+# MODE 2 — CSV COHORT (TRUE PSEUDOTIME)
 # ============================================================
-with tab2:
-    st.subheader("Cohort Analysis (CSV Upload)")
-    uploaded_file = st.file_uploader("Upload a CSV file", type=["csv"], key="cohort_uploader")
+else:
+    st.header("Cohort Analysis (CSV Upload)")
 
-    if uploaded_file is not None:
-        df = pd.read_csv(uploaded_file)
-        st.markdown("**Uploaded Data Preview**")
-        st.dataframe(df.head(), use_container_width=True)
-
-        X = transform_with_runtime_reference(df)
-        latents = compute_latent(model, X)
-        clusters = assign_cluster(kmeans, latents)
-        pseudotime = compute_pseudotime(latents)
-        ood_flags, recon_errors = check_ood(model, X, ood_threshold)
-
-        result_df = df.copy()
-        result_df["Cluster"] = clusters
-        result_df["Phenotype"] = [cluster_info[int(c)]["name"] for c in clusters]
-        result_df["Pseudotime"] = pseudotime
-        result_df["OOD_Flag"] = ood_flags
-        result_df["Reconstruction_Error"] = recon_errors
-        result_df["z1"] = latents[:, 0]
-        result_df["z2"] = latents[:, 1]
-
-        st.divider()
-        st.header("Cohort Results")
-        st.dataframe(result_df, use_container_width=True)
-
-        cluster_summary = (
-            result_df
-            .groupby(["Cluster", "Phenotype"])
-            .agg(
-                Count=("Cluster", "count"),
-                Mean_Pseudotime=("Pseudotime", "mean"),
-                Mean_Reconstruction_Error=("Reconstruction_Error", "mean")
-            )
-            .reset_index()
-            .sort_values("Mean_Pseudotime")
-        )
-
-        st.subheader("Cluster-Level Summary")
-        st.dataframe(cluster_summary, use_container_width=True)
-
-        # Cluster scatter
-        st.subheader("Latent Space Visualization by Cluster")
-        fig1, ax1 = plt.subplots(figsize=(7, 5))
-        sns.scatterplot(
-            x=latents[:, 0],
-            y=latents[:, 1],
-            hue=clusters,
-            palette="tab10",
-            alpha=0.7,
-            s=25,
-            ax=ax1
-        )
-        ax1.set_xlabel("Latent Dimension 1 (z1)")
-        ax1.set_ylabel("Latent Dimension 2 (z2)")
-        ax1.set_title("Latent Space Colored by Cluster")
-        ax1.legend(title="Cluster", bbox_to_anchor=(1.02, 1), loc="upper left")
-        st.pyplot(fig1)
-
-        # Pseudotime scatter
-        st.subheader("Latent Space Pseudotime Gradient")
-        fig2, ax2 = plt.subplots(figsize=(7, 5))
-        sc = ax2.scatter(
-            latents[:, 0],
-            latents[:, 1],
-            c=pseudotime,
-            cmap="plasma",
-            alpha=0.7,
-            s=25
-        )
-        fig2.colorbar(sc, ax=ax2, label="Pseudotime")
-        ax2.set_xlabel("Latent Dimension 1 (z1)")
-        ax2.set_ylabel("Latent Dimension 2 (z2)")
-        ax2.set_title("Latent Space Colored by Pseudotime")
-        st.pyplot(fig2)
-
-        st.download_button(
-            "Download Cohort Results CSV",
-            result_df.to_csv(index=False),
-            file_name="cohort_tb_results.csv",
-            mime="text/csv"
-        )
-
-# ============================================================
-# TAB 3: SYNTHETIC DATA
-# ============================================================
-with tab3:
-    st.subheader("Synthetic Patient Generation")
-    st.caption(
-        "Generate synthetic tuberculosis patient profiles from the learned latent space."
+    # ✅ DEFINE file FIRST (this was missing)
+    uploaded_file = st.file_uploader(
+        "Upload CSV file for cohort analysis",
+        type=["csv"]
     )
 
-    num_samples = st.slider("Number of synthetic patients", 10, 200, 50)
+    if uploaded_file is None:
+        st.info("Please upload a CSV file to run cohort-based pseudotime analysis.")
+    else:
+        df = pd.read_csv(uploaded_file)
 
-    if st.button("Generate Synthetic Patients"):
-        latent_dim = model.mu.out_features
-        z = np.random.normal(0, 1, size=(num_samples, latent_dim))
+        st.subheader("Uploaded CSV Preview")
+        st.dataframe(df.head())
 
-        synthetic = decode_latent(model, z)
-        syn_df = pd.DataFrame(synthetic, columns=feature_names)
+        # ✅ Check required columns
+        required_cols = continuous_cols + binary_cols + categorical_cols
+        missing = set(required_cols) - set(df.columns)
 
-        latent_syn = compute_latent(model, synthetic)
-        pseudo_syn = compute_pseudotime(latent_syn)
-        cluster_syn = assign_cluster(kmeans, latent_syn)
+        if missing:
+            st.error(f"Missing required columns in CSV: {sorted(missing)}")
+            st.stop()
 
-        synth_summary = pd.DataFrame({
-            "Metric": [
-                "Number of Profiles",
-                "Mean Pseudotime",
-                "Min Pseudotime",
-                "Max Pseudotime"
-            ],
-            "Value": [
-                num_samples,
-                float(np.mean(pseudo_syn)),
-                float(np.min(pseudo_syn)),
-                float(np.max(pseudo_syn))
-            ]
-        })
-
-        cluster_counts = (
-            pd.Series(cluster_syn)
-            .value_counts()
-            .sort_index()
-            .rename_axis("Cluster")
-            .reset_index(name="Count")
-        )
-        cluster_counts["Phenotype"] = cluster_counts["Cluster"].map(
-            lambda x: cluster_info[int(x)]["name"]
+        # Build preprocessor
+        pre = build_preprocessor(
+            continuous_cols,
+            binary_cols,
+            categorical_cols
         )
 
-        st.success(f"Generated {num_samples} synthetic patient profiles.")
-        st.markdown("**Synthetic Data Summary**")
-        st.dataframe(synth_summary, use_container_width=True)
+        # Dummy fit (same as single-patient mode)
+        dummy = {}
+        for c in continuous_cols:
+            dummy[c] = 0.0
+        for c in binary_cols:
+            dummy[c] = 0
+        for c in categorical_cols:
+            dummy[c] = "Unknown"
 
-        st.markdown("**Synthetic Phenotype Distribution**")
-        st.dataframe(cluster_counts, use_container_width=True)
+        pre.fit(pd.DataFrame([dummy]))
 
-        st.markdown("**Synthetic Data Preview**")
-        st.dataframe(syn_df.head(10), use_container_width=True)
+        # Transform cohort
+        X = pre.transform(df)
+        X = pd.DataFrame(X, columns=pre.get_feature_names_out())
 
-        st.download_button(
-            "Download Synthetic Dataset (CSV)",
-            syn_df.to_csv(index=False),
-            file_name="synthetic_tb_patients.csv",
-            mime="text/csv"
+        with open("models/feature_names.json") as f:
+            feature_names = json.load(f)
+
+        X = X.reindex(columns=feature_names, fill_value=0).values
+
+        # Latent inference
+        latents = compute_latent(model, X)
+
+        # ✅ TRUE cohort-based pseudotime
+        z1 = latents[:, 0]
+        pseudotime = (z1 - z1.min()) / (z1.max() - z1.min() + 1e-10)
+
+        clusters = assign_cluster(kmeans, latents)
+
+        df["pseudotime"] = pseudotime
+        df["phenotype"] = [cluster_info[c][0] for c in clusters]
+
+        st.subheader("Cohort Results")
+        st.dataframe(df.sort_values("pseudotime", ascending=False))
+
+        st.caption(
+            "Pseudotime here reflects true relative progression across the uploaded cohort."
         )
-
+    
 # ============================================================
-# FOOTER
+# SYNTHETIC DATA GENERATION (DECODED)
 # ============================================================
 st.divider()
+st.header("Synthetic Patient Generation")
+
+num_samples = st.slider("Number of synthetic patients", 10, 100, 50)
+
+if st.button("Generate Synthetic Patients"):
+
+    model, feature_names = load_ttvae()
+    device = next(model.parameters()).device
+
+    example_z = compute_latent(model, np.zeros((1, len(feature_names))))
+    latent_dim = example_z.shape[1]
+
+    z = torch.randn(num_samples, latent_dim).to(device)
+
+    with torch.no_grad():
+        synthetic = model.decode(z).cpu().numpy()
+
+    syn = pd.DataFrame(synthetic, columns=feature_names)
+
+    # ===========================
+    # ✅ DECODE SYNTHETIC DATA
+    # ===========================
+
+    decoded = pd.DataFrame()
+
+    # ---- Age (inverse scaling: assume 0–100)
+    decoded["age_census"] = (syn["cont__age_census"] * 100).round().astype(int)
+
+    # ---- Binary variables
+    bin_cols = [c for c in syn.columns if c.startswith("bin__")]
+    for col in bin_cols:
+        decoded[col.replace("bin__", "")] = (syn[col] >= 0.5).astype(int)
+
+    # ---- Region (one-hot)
+    region_cols = [c for c in syn.columns if c.startswith("cat__region")]
+    decoded["region"] = (
+        syn[region_cols].idxmax(axis=1).str.replace("cat__region_", "")
+    )
+
+    st.success(f"Generated {num_samples} decoded synthetic patients")
+
+    st.dataframe(decoded.head(10))
+
+    st.download_button(
+        "Download Decoded Synthetic Dataset",
+        decoded.to_csv(index=False),
+        file_name="synthetic_tb_patients_decoded.csv"
+    )
+
+st.divider()
 st.caption(
-    "This system supports latent tuberculosis risk profiling, phenotype discovery, cohort exploration, "
-    "and synthetic data generation using unsupervised representation learning. It does not replace clinical diagnosis."
+    "Synthetic data are generated in model feature space and decoded for clinical "
+    "interpretability. This system does not replace medical diagnosis."
 )
