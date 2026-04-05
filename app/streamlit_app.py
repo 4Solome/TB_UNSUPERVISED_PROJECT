@@ -178,7 +178,7 @@ if uploaded_file and analyze:
             "Risk Category": risk_category,
             "Phenotype": [PHENOTYPE_INFO[c][0] for c in clusters],
             "Reliability": reliability
-            "Reconstruction Error": np.round(rec_error, 3)
+            #"Reconstruction Error": np.round(rec_error, 3)
         })
 
     except Exception:
@@ -250,8 +250,8 @@ if results is not None:
     with st.expander("Cluster‑Level Summary"):
         summary = results.groupby("Phenotype").agg(
             Count=("Pseudotime", "count"),
-            Mean_Pseudotime=("Pseudotime", "mean"),
-            Mean_Reconstruction_Error=("Reconstruction Error", "mean")
+            Mean_Pseudotime=("Pseudotime", "mean")
+            #Mean_Reconstruction_Error=("Reconstruction Error", "mean")
         ).reset_index()
         st.dataframe(summary)
 
