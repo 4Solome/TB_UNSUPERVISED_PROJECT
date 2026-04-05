@@ -178,7 +178,7 @@ if uploaded_file and analyze:
             "Risk Category": risk_category,
             "Phenotype": [PHENOTYPE_INFO[c][0] for c in clusters],
             "Reliability": reliability
-            #"Reconstruction Error": np.round(rec_error, 3)
+            "Reconstruction Error": np.round(rec_error, 3)
         })
 
     except Exception:
