@@ -126,10 +126,10 @@ if uploaded_file and analyze:
 
     rec_error = ((rec.numpy() - X) ** 2).mean(axis=1)
 
-# TEMPORARY: cohort-relative OOD for visualization & screenshots
-ood_flag = rec_error > np.percentile(rec_error, 95)
+    # TEMPORARY: cohort-relative OOD for visualization & screenshots
+    ood_flag = rec_error > np.percentile(rec_error, 95)
 
-reliability = ["⚠️ OOD Warning" if f else "✅ In Distribution" for f in ood_flag]
+    reliability = ["⚠️ OOD Warning" if f else "✅ In Distribution" for f in ood_flag]
 
 
 
