@@ -12,15 +12,16 @@ from sklearn.pipeline import Pipeline
 from ttvae_model import TTVAE
 
 # ============================================================
-# PATH HANDLING (CRITICAL FOR STREAMLIT CLOUD)
+# PATH HANDLING (CORRECT FOR YOUR REPO STRUCTURE)
 # ============================================================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODELS_DIR = os.path.join(BASE_DIR, "models")
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(APP_DIR)
+MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
 
 device = torch.device("cpu")
 
 # ============================================================
-# LOAD PSEUDOTIME REFERENCE BOUNDS (FROM TRAINING)
+# LOAD PSEUDOTIME REFERENCE BOUNDS
 # ============================================================
 PT_BOUNDS_PATH = os.path.join(MODELS_DIR, "pseudotime_bounds.json")
 
@@ -31,7 +32,7 @@ _Z1_MIN = _pt_bounds["z1_min"]
 _Z1_MAX = _pt_bounds["z1_max"]
 
 # ============================================================
-# BUILD PREPROCESSOR (RUNTIME-SAFE, NO PICKLE)
+# BUILD PREPROCESSOR (NO PICKLING)
 # ============================================================
 def build_preprocessor(continuous_cols, binary_cols, categorical_cols):
 
@@ -84,12 +85,10 @@ def load_ttvae():
 # LOAD OTHER ARTIFACTS
 # ============================================================
 def load_cluster_model():
-    path = os.path.join(MODELS_DIR, "kmeans_model.joblib")
-    return joblib.load(path)
+    return joblib.load(os.path.join(MODELS_DIR, "kmeans_model.joblib"))
 
 def load_ood_threshold():
-    path = os.path.join(MODELS_DIR, "ood_threshold.json")
-    with open(path, "r") as f:
+    with open(os.path.join(MODELS_DIR, "ood_threshold.json"), "r") as f:
         return json.load(f)["ood_threshold"]
 
 # ============================================================
@@ -104,9 +103,7 @@ def compute_latent(model, X):
 def compute_pseudotime(latents):
     """
     Reference-normalized pseudotime.
-    ✅ Works for single patient
-    ✅ Works for cohort / CSV
-    ✅ Uses training population bounds
+    Works for single patient and cohort analysis.
     """
     z1 = latents[:, 0]
     return (z1 - _Z1_MIN) / (_Z1_MAX - _Z1_MIN + 1e-10)
