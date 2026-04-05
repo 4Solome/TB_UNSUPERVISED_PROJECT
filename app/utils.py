@@ -1,8 +1,8 @@
+import os
+import json
 import torch
 import numpy as np
 import joblib
-import json
-from pathlib import Path
 
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
@@ -11,32 +11,30 @@ from sklearn.pipeline import Pipeline
 
 from ttvae_model import TTVAE
 
+# ============================================================
+# PATH HANDLING (CRITICAL FOR STREAMLIT CLOUD)
+# ============================================================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODELS_DIR = os.path.join(BASE_DIR, "models")
+
 device = torch.device("cpu")
 
-BASE_DIR = Path(__file__).resolve().parent
-MODELS_DIR = BASE_DIR / "models"
+# ============================================================
+# LOAD PSEUDOTIME REFERENCE BOUNDS (FROM TRAINING)
+# ============================================================
+PT_BOUNDS_PATH = os.path.join(MODELS_DIR, "pseudotime_bounds.json")
 
-# ---------------------------------------------------------------------
-# Load pseudotime reference bounds (computed once from training latents)
-# ---------------------------------------------------------------------
-def _load_pseudotime_bounds():
-    bounds_path = MODELS_DIR / "pseudotime_bounds.json"
-    if bounds_path.exists():
-        with open(bounds_path, "r") as f:
-            bounds = json.load(f)
-        z1_min = float(bounds["z1_min"])
-        z1_max = float(bounds["z1_max"])
-    else:
-        z1_min = 0.0
-        z1_max = 1.0
-    return z1_min, z1_max
+with open(PT_BOUNDS_PATH, "r") as f:
+    _pt_bounds = json.load(f)
 
-_Z1_MIN, _Z1_MAX = _load_pseudotime_bounds()
+_Z1_MIN = _pt_bounds["z1_min"]
+_Z1_MAX = _pt_bounds["z1_max"]
 
-# ---------------------------------------------------------------------
-# Build preprocessing (runtime-safe, no pickled preprocessor)
-# ---------------------------------------------------------------------
+# ============================================================
+# BUILD PREPROCESSOR (RUNTIME-SAFE, NO PICKLE)
+# ============================================================
 def build_preprocessor(continuous_cols, binary_cols, categorical_cols):
+
     cont_pipe = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
         ("scaler", MinMaxScaler())
@@ -62,75 +60,63 @@ def build_preprocessor(continuous_cols, binary_cols, categorical_cols):
         ("cat", cat_pipe, categorical_cols)
     ])
 
-# ---------------------------------------------------------------------
-# Load trained TTVAE using saved training feature space
-# ---------------------------------------------------------------------
+# ============================================================
+# LOAD TRAINED TTVAE
+# ============================================================
 def load_ttvae():
-    feature_names_path = MODELS_DIR / "feature_names.json"
-    weights_path = MODELS_DIR / "ttvae_best.pth"
+
+    feature_names_path = os.path.join(MODELS_DIR, "feature_names.json")
+    weights_path = os.path.join(MODELS_DIR, "ttvae_best.pth")
 
     with open(feature_names_path, "r") as f:
         feature_names = json.load(f)
 
-    d_in = len(feature_names)
+    D_in = len(feature_names)
 
-    model = TTVAE(D_in=d_in).to(device)
+    model = TTVAE(D_in=D_in).to(device)
     state = torch.load(weights_path, map_location=device)
     model.load_state_dict(state)
     model.eval()
 
     return model, feature_names
 
-# ---------------------------------------------------------------------
-# Auxiliary artifacts
-# ---------------------------------------------------------------------
-def load_ood_threshold():
-    threshold_path = MODELS_DIR / "ood_threshold.json"
-    with open(threshold_path, "r") as f:
-        return float(json.load(f)["ood_threshold"])
-
+# ============================================================
+# LOAD OTHER ARTIFACTS
+# ============================================================
 def load_cluster_model():
-    return joblib.load(MODELS_DIR / "kmeans_model.joblib")
+    path = os.path.join(MODELS_DIR, "kmeans_model.joblib")
+    return joblib.load(path)
 
-def load_pseudotime_bounds():
-    return {"z1_min": _Z1_MIN, "z1_max": _Z1_MAX}
+def load_ood_threshold():
+    path = os.path.join(MODELS_DIR, "ood_threshold.json")
+    with open(path, "r") as f:
+        return json.load(f)["ood_threshold"]
 
-# ---------------------------------------------------------------------
-# Inference utilities
-# ---------------------------------------------------------------------
+# ============================================================
+# INFERENCE UTILITIES
+# ============================================================
 def compute_latent(model, X):
-    X_np = np.asarray(X, dtype=np.float32)
-    X_t = torch.tensor(X_np, dtype=torch.float32).to(device)
+    X_t = torch.tensor(X, dtype=torch.float32).to(device)
     with torch.no_grad():
         mu, _ = model.encode(X_t)
     return mu.cpu().numpy()
 
 def compute_pseudotime(latents):
     """
-    Compute pseudotime relative to training latent bounds.
-    Works for single-patient and cohort inference.
+    Reference-normalized pseudotime.
+    ✅ Works for single patient
+    ✅ Works for cohort / CSV
+    ✅ Uses training population bounds
     """
-    latents = np.asarray(latents, dtype=np.float32)
     z1 = latents[:, 0]
-    pt = (z1 - _Z1_MIN) / (_Z1_MAX - _Z1_MIN + 1e-10)
-    return np.clip(pt, 0.0, 1.0)
+    return (z1 - _Z1_MIN) / (_Z1_MAX - _Z1_MIN + 1e-10)
 
 def check_ood(model, X, threshold):
-    X_np = np.asarray(X, dtype=np.float32)
-    X_t = torch.tensor(X_np, dtype=torch.float32).to(device)
+    X_t = torch.tensor(X, dtype=torch.float32).to(device)
     with torch.no_grad():
         rec, _, _ = model(X_t)
-    rec_np = rec.cpu().numpy()
-    err = ((rec_np - X_np) ** 2).mean(axis=1)
+    err = ((rec.cpu().numpy() - X) ** 2).mean(axis=1)
     return err > threshold, err
 
 def assign_cluster(kmeans, latents):
-    latents = np.asarray(latents, dtype=np.float32)
     return kmeans.predict(latents)
-
-def decode_latent(model, z):
-    z_np = np.asarray(z, dtype=np.float32)
-    z_t = torch.tensor(z_np, dtype=torch.float32).to(device)
-    with torch.no_grad():
-        decoded = model.decode(z_t)
-    return decoded.cpu().numpy()
