@@ -23,7 +23,7 @@ st.set_page_config(page_title="TB Risk Profiling System", layout="wide")
 st.title("TB Risk Profiling System")
 st.caption(
     "A cohort‑based system for latent tuberculosis risk sequencing and "
-    "phenotype discovery using a Transformer‑based Tabular Variational Autoencoder."
+    "phenotype discovery."
 )
 
 # ============================================================
