@@ -348,7 +348,7 @@ if st.button("Generate Synthetic Patients"):
     st.dataframe(decoded.head(10), use_container_width=True)
 
     st.download_button(
-        "Download Decoded Synthetic Dataset",
+        "Download Synthetic Dataset",
         decoded.to_csv(index=False),
         file_name="synthetic_tb_patients_decoded.csv",
         mime="text/csv"
